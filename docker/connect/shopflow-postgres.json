@@ -1,0 +1,22 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "debezium",
+  "database.password": "${env:DEBEZIUM_PASSWORD}",
+  "database.dbname": "shopflow",
+  "topic.prefix": "shopflow",
+  "schema.include.list": "shop",
+  "plugin.name": "pgoutput",
+  "publication.name": "shopflow_cdc",
+  "publication.autocreate.mode": "disabled",
+  "slot.name": "shopflow_debezium",
+  "snapshot.mode": "initial",
+  "decimal.handling.mode": "string",
+  "tombstones.on.delete": "false",
+  "heartbeat.interval.ms": "10000",
+  "topic.creation.default.replication.factor": "1",
+  "topic.creation.default.partitions": "1",
+  "topic.creation.default.cleanup.policy": "delete",
+  "topic.creation.default.retention.ms": "604800000"
+}

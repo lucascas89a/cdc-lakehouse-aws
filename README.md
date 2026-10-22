@@ -122,11 +122,48 @@ flowchart LR
 Target: **under USD 5 per month** on AWS for the demo (S3 storage, Athena scans,
 Glue catalog), with an AWS Budget alarm in place. The compute runs on an existing VM.
 
+## Quickstart
+
+Requirements: Docker with Compose v2, about 3 GB of free RAM.
+
+```bash
+cp docker/.env.example docker/.env      # then fill in two random passwords
+docker compose -f docker/compose.yaml up -d
+./scripts/register-connector.sh         # registers the Debezium connector
+```
+
+Make a change in the source database and watch it arrive in Kafka:
+
+```bash
+docker compose -f docker/compose.yaml exec postgres \
+  psql -U shopflow_admin -d shopflow -c "UPDATE shop.orders SET status = 'paid' WHERE order_id = 1"
+
+docker compose -f docker/compose.yaml exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic shopflow.shop.orders --from-beginning
+```
+
+Optional web UI for topics and connectors: `docker compose -f docker/compose.yaml --profile ui up -d`,
+then open <http://localhost:8090>.
+
+Each event carries the row `before` and `after` the change, the operation (`c`, `u`, `d`, or `r` for
+snapshot reads) and the source LSN, which the silver layer uses to apply changes exactly once.
+
+| Service | Image | Memory limit |
+|---|---|---|
+| PostgreSQL (source) | `postgres:16-bookworm` | 512 MB |
+| Kafka (KRaft, single node) | `apache/kafka:4.3.1` | 1 GB |
+| Kafka Connect + Debezium | `quay.io/debezium/connect:3.6.2.Final` | 1 GB |
+| kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
+
+Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
+`shop` schema, and its password reaches the connector through Kafka's `EnvVarConfigProvider`,
+so it never appears in the connector config or the REST API.
+
 ## Roadmap
 
 - [x] Source data model and schema
 - [x] Architecture
-- [ ] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
+- [x] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
 - [ ] Data generator with live changes
 - [ ] AWS infrastructure in Terraform (S3, IAM, Glue, Athena)
 - [ ] Bronze and silver streaming jobs (Spark + Delta on S3)
