@@ -142,6 +142,18 @@ docker compose -f docker/compose.yaml exec kafka /opt/kafka/bin/kafka-console-co
   --bootstrap-server localhost:9092 --topic shopflow.shop.orders --from-beginning
 ```
 
+Start the live data generator (customers ordering, paying with failures and retries, shipping,
+price changes, cart edits that produce deletes):
+
+```bash
+docker compose -f docker/compose.yaml --profile generator up -d generator
+docker compose -f docker/compose.yaml logs -f generator     # progress every 60 s
+```
+
+Time is compressed (one simulated hour = 60 s by default). Tune it with `GENERATOR_RATE` (actions per
+second, default 1) and `GENERATOR_TIME_SCALE` in `docker/.env`. The generator connects with its own
+role that can only read and write rows in the `shop` schema.
+
 Optional web UI for topics and connectors: `docker compose -f docker/compose.yaml --profile ui up -d`,
 then open <http://localhost:8090>.
 
@@ -153,6 +165,7 @@ snapshot reads) and the source LSN, which the silver layer uses to apply changes
 | PostgreSQL (source) | `postgres:16-bookworm` | 512 MB |
 | Kafka (KRaft, single node) | `apache/kafka:4.3.1` | 1 GB |
 | Kafka Connect + Debezium | `quay.io/debezium/connect:3.6.2.Final` | 1 GB |
+| Data generator (optional) | built from `generator/` | 128 MB |
 | kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
 
 Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
@@ -164,7 +177,7 @@ so it never appears in the connector config or the REST API.
 - [x] Source data model and schema
 - [x] Architecture
 - [x] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
-- [ ] Data generator with live changes
+- [x] Data generator with live changes
 - [ ] AWS infrastructure in Terraform (S3, IAM, Glue, Athena)
 - [ ] Bronze and silver streaming jobs (Spark + Delta on S3)
 - [ ] Gold layer and data quality checks (Airflow)
@@ -175,6 +188,8 @@ so it never appears in the connector config or the REST API.
 
 ```
 docker/      Docker Compose stack and service configs
+generator/   Live data generator for the source database
+scripts/     Helper scripts
 terraform/   AWS infrastructure
 spark/       Streaming and batch jobs
 airflow/     DAGs

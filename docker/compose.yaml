@@ -26,6 +26,7 @@ services:
       POSTGRES_USER: shopflow_admin
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in docker/.env}
       DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:?set it in docker/.env}
+      GENERATOR_PASSWORD: ${GENERATOR_PASSWORD:?set it in docker/.env}
     volumes:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - pg_data:/var/lib/postgresql/data
@@ -103,6 +104,25 @@ services:
       retries: 10
       start_period: 30s
     mem_limit: 1g
+    logging: *logging
+    restart: unless-stopped
+
+  generator:
+    build: ../generator
+    image: cdc-lakehouse/generator:local
+    profiles: [generator]
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGHOST: postgres
+      PGUSER: generator
+      PGPASSWORD: ${GENERATOR_PASSWORD:?set it in docker/.env}
+      RATE: ${GENERATOR_RATE:-1}               # actions per second
+      TIME_SCALE: ${GENERATOR_TIME_SCALE:-60}  # real seconds per simulated hour
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
     logging: *logging
     restart: unless-stopped
 
