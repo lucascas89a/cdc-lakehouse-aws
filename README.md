@@ -1,0 +1,146 @@
+# cdc-lakehouse-aws
+
+Real-time change data capture from PostgreSQL into a Delta Lake lakehouse on Amazon S3,
+with a gold layer that dashboards and AI agents can query safely.
+
+> **Status:** work in progress. See [Roadmap](#roadmap).
+
+## Why this project
+
+Most small companies want to "add AI" on top of data that lives in an operational
+database, gets exported by nightly scripts, and nobody fully trusts. This project
+shows an end-to-end alternative that a startup can run without a data team:
+
+- Every insert, update and delete in the source database is captured within seconds.
+- History is kept (order status transitions, price changes), not overwritten.
+- PII never leaves the silver layer unmasked.
+- The gold layer is cheap to query on AWS and exposed to an AI agent through
+  narrow, read-only tools instead of raw database access.
+
+The example domain is **ShopFlow**, a fictional LATAM e-commerce. See
+[docs/data-model.md](docs/data-model.md).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph SRC["Source (Docker)"]
+        GEN["Data generator<br/>orders, payments, shipments"]
+        PG[("PostgreSQL 16<br/>shop schema<br/>wal_level=logical")]
+        GEN -->|"inserts / updates / deletes"| PG
+    end
+
+    subgraph STREAM["Streaming (Docker)"]
+        DBZ["Kafka Connect<br/>+ Debezium PostgreSQL"]
+        KAFKA[["Kafka (KRaft)<br/>one topic per table"]]
+        SPARK["Spark Structured Streaming"]
+        PG -->|"pgoutput<br/>logical replication"| DBZ
+        DBZ --> KAFKA
+        KAFKA --> SPARK
+    end
+
+    subgraph AWS["AWS (Terraform)"]
+        subgraph S3["S3 lake bucket (Delta Lake)"]
+            BRONZE[("bronze<br/>raw CDC events,<br/>append-only")]
+            SILVER[("silver<br/>current state + history,<br/>PII masked")]
+            GOLD[("gold<br/>business tables")]
+        end
+        GLUE["Glue Data Catalog"]
+        ATHENA["Athena<br/>workgroup with scan limit"]
+        GOLD -.->|registered in| GLUE
+        GLUE --> ATHENA
+    end
+
+    subgraph ORCH["Orchestration (Docker)"]
+        AIRFLOW["Airflow<br/>gold builds, quality checks,<br/>OPTIMIZE / VACUUM"]
+    end
+
+    subgraph CONSUME["Consumption"]
+        AGENT["AI agent tools<br/>read-only, gold only"]
+        BI["Dashboards / SQL"]
+    end
+
+    SPARK -->|"append"| BRONZE
+    SPARK -->|"MERGE per micro-batch"| SILVER
+    AIRFLOW -->|"Spark batch"| GOLD
+    SILVER --> AIRFLOW
+    ATHENA --> AGENT
+    ATHENA --> BI
+```
+
+### Data flow
+
+1. **Capture.** Debezium reads the PostgreSQL write-ahead log through a logical
+   replication slot and publishes one event per row change to Kafka
+   (`shopflow.shop.<table>`). Each event carries the row before and after the change.
+2. **Bronze.** A Spark streaming job appends every event as-is to Delta tables on S3,
+   partitioned by table and date. Bronze is the replayable audit log.
+3. **Silver.** A second streaming query `MERGE`s each micro-batch into clean tables:
+   current state for most entities, SCD Type 2 history for `products`, an
+   `order_status_history` table built from status transitions, and masked PII.
+   Late or duplicated events are resolved using the source LSN, so reprocessing is
+   idempotent.
+4. **Gold.** Airflow rebuilds business tables from silver on a schedule (sales by
+   country and category, payment failure rates, late shipments, order lead times,
+   customer lifetime value) and runs data quality checks before publishing them.
+5. **Serve.** Gold tables are registered in the Glue Data Catalog and queried with
+   Athena. The AI agent gets a small set of read-only tools on top of those tables.
+
+### Where each piece runs
+
+| Component | Runs on | Why |
+|---|---|---|
+| PostgreSQL, Kafka, Debezium, Spark, Airflow | Docker Compose on a single VM, with per-service memory limits and profiles | Keeps the always-on cost at zero; the same images run on ECS/EKS |
+| Delta tables (bronze, silver, gold) | Amazon S3 | Durable, cheap storage that any engine can read |
+| Catalog and SQL | AWS Glue Data Catalog + Amazon Athena | Serverless, pay per query, no cluster to keep running |
+| AI agent tools | Container on the VM, calling Athena | Narrow, read-only access to gold |
+| AWS infrastructure | Terraform | Reproducible, reviewable, destroyable with one command |
+
+## Design decisions
+
+| Decision | Alternative considered | Reasoning |
+|---|---|---|
+| Debezium + Kafka for CDC | AWS DMS | Debezium is open source, keeps before/after images and ordering per key, and runs anywhere. DMS is a good fit when the team wants a managed service and is already all-in on AWS. |
+| Self-managed Kafka in Docker | Amazon MSK | MSK starts at hundreds of USD per month. For production with real SLAs, MSK (or MSK Serverless) is what I would recommend. |
+| Airflow in Docker | Amazon MWAA | Same reasoning: MWAA has a fixed monthly cost. The DAGs are portable to MWAA unchanged. |
+| Delta Lake | Apache Iceberg | Delta has mature `MERGE` support in open-source Spark and Athena reads it natively. Iceberg would be the choice if the client is standardising on it. |
+| Athena over gold only | Querying silver directly | Gold tables are small, documented and free of PII, which keeps both query cost and agent risk low. |
+| Agent tools instead of free-form SQL | Letting the LLM write SQL | Predictable cost and behaviour; every tool maps to a question the business actually asks. |
+| `REPLICA IDENTITY FULL` on source tables | Default (primary key only) | Full before-images make status transitions and price history trivial to derive, at the cost of more WAL. |
+
+## Security
+
+- No long-lived AWS keys for humans; the pipeline uses an IAM identity scoped to
+  the lake bucket only, and the agent uses a read-only identity scoped to gold and
+  Athena.
+- S3 bucket: encryption at rest, public access blocked, TLS enforced.
+- Secrets live in an untracked `.env`, never in the repository.
+- PII (`email`, `full_name`) is hashed in silver; gold contains no PII.
+
+## Cost
+
+Target: **under USD 5 per month** on AWS for the demo (S3 storage, Athena scans,
+Glue catalog), with an AWS Budget alarm in place. The compute runs on an existing VM.
+
+## Roadmap
+
+- [x] Source data model and schema
+- [x] Architecture
+- [ ] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
+- [ ] Data generator with live changes
+- [ ] AWS infrastructure in Terraform (S3, IAM, Glue, Athena)
+- [ ] Bronze and silver streaming jobs (Spark + Delta on S3)
+- [ ] Gold layer and data quality checks (Airflow)
+- [ ] AI agent tools over gold
+- [ ] Demo video
+
+## Repository layout
+
+```
+docker/      Docker Compose stack and service configs
+terraform/   AWS infrastructure
+spark/       Streaming and batch jobs
+airflow/     DAGs
+agent/       AI agent tools over the gold layer
+docs/        Data model and design notes
+```

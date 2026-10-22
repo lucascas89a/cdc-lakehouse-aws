@@ -1,0 +1,22 @@
+# Secrets and local env
+.env
+*.env
+secrets/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local data
+data/
+checkpoints/
+spark-warehouse/
+logs/
