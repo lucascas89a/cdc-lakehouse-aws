@@ -144,3 +144,7 @@ airflow/     DAGs
 agent/       AI agent tools over the gold layer
 docs/        Data model and design notes
 ```
+
+## License
+
+[MIT](LICENSE)
