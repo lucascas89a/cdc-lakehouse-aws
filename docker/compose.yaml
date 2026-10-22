@@ -126,6 +126,27 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  spark-bronze:
+    build: ../spark
+    image: cdc-lakehouse/spark:local
+    profiles: [spark]
+    command: ["python", "jobs/bronze_cdc.py"]
+    depends_on:
+      kafka: { condition: service_healthy }
+    env_file: [aws-pipeline.env]          # pipeline IAM user + LAKE_BUCKET, git-ignored
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      SPARK_DRIVER_MEMORY: 1g
+      TRIGGER_INTERVAL: ${BRONZE_TRIGGER_INTERVAL:-1 minute}
+    ports: ["127.0.0.1:4040:4040"]       # Spark UI
+    read_only: true
+    tmpfs: ["/tmp:size=1g,exec", "/home/spark:size=64m"]   # exec: snappy/zstd extract native libs to /tmp
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    logging: *logging
+    restart: unless-stopped
+
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     profiles: [ui]

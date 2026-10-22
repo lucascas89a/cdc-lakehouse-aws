@@ -166,11 +166,44 @@ snapshot reads) and the source LSN, which the silver layer uses to apply changes
 | Kafka (KRaft, single node) | `apache/kafka:4.3.1` | 1 GB |
 | Kafka Connect + Debezium | `quay.io/debezium/connect:3.6.2.Final` | 1 GB |
 | Data generator (optional) | built from `generator/` | 128 MB |
+| Spark bronze job (optional) | built from `spark/` | 2 GB |
 | kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
 
 Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
 `shop` schema, and its password reaches the connector through Kafka's `EnvVarConfigProvider`,
 so it never appears in the connector config or the REST API.
+
+## Bronze layer (Spark Structured Streaming)
+
+`spark/jobs/bronze_cdc.py` subscribes to every `shopflow.shop.*` topic and appends each Debezium event,
+untouched, to a single Delta table at `s3://<lake-bucket>/bronze/cdc_events`, partitioned by
+`event_date` and `source_table`.
+
+```bash
+# needs docker/aws-pipeline.env with the pipeline IAM key and LAKE_BUCKET
+docker compose -f docker/compose.yaml --profile spark up -d spark-bronze
+```
+
+| Column | Meaning |
+|---|---|
+| `source_table`, `op`, `source_lsn`, `source_ts_ms` | Lifted from the payload for cheap filtering and ordering |
+| `payload` | Raw Debezium JSON (`before`, `after`, `source`, `op`), parsed only in silver |
+| `kafka_topic`, `kafka_partition`, `kafka_offset`, `kafka_timestamp` | Lineage back to Kafka |
+| `ingested_at`, `event_date` | Load time and partition date |
+
+Design notes:
+
+- **Raw payload as a string.** An upstream schema change can never break ingestion; bronze stays a
+  faithful, replayable log and parsing errors are handled in silver.
+- **Exactly-once.** The checkpoint on S3 ties Kafka offsets to Delta commits. Verified after a restart:
+  15,340 events, zero duplicate offsets, zero gaps across all six topics.
+- **Single writer per table.** Delta's default S3 log store is safe with one writer; multiple concurrent
+  writers to the same table would need a coordinated log store.
+- **Cost-aware trigger.** Each micro-batch issues S3 requests, so the default trigger is one minute and
+  the job is meant to run on demand in the demo. Small files are compacted later with `OPTIMIZE`.
+- **Image built for reproducibility.** Spark 4.2.0, Delta 4.4.1 and hadoop-aws 3.5.0 jars are resolved at
+  build time (no Maven access at runtime), skipping libraries Spark already ships and pinning Jackson to
+  Spark's version to avoid classpath conflicts. Runs as a non-root user on a read-only filesystem.
 
 ## AWS infrastructure (Terraform)
 
@@ -210,7 +243,8 @@ Choices worth calling out:
 - [x] Data generator with live changes
 - [x] AWS infrastructure in Terraform: S3 lake, remote state, least-privilege pipeline identity
 - [ ] Glue Data Catalog and Athena workgroup (Terraform)
-- [ ] Bronze and silver streaming jobs (Spark + Delta on S3)
+- [x] Bronze streaming job (Kafka -> Delta on S3, exactly-once verified)
+- [ ] Silver streaming job (MERGE, SCD2, PII masking)
 - [ ] Gold layer and data quality checks (Airflow)
 - [ ] AI agent tools over gold
 - [ ] Demo video
