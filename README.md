@@ -172,13 +172,44 @@ Debezium connects with a dedicated role that only has `REPLICATION` and read acc
 `shop` schema, and its password reaches the connector through Kafka's `EnvVarConfigProvider`,
 so it never appears in the connector config or the REST API.
 
+## AWS infrastructure (Terraform)
+
+Two stacks under `terraform/`:
+
+| Stack | Creates | State |
+|---|---|---|
+| `bootstrap/` | S3 bucket for Terraform state (versioned, encrypted, TLS-only, `prevent_destroy`) | Local (copied to the state bucket as a backup) |
+| `lake/` | Lake bucket (`bronze/`, `silver/`, `gold/`, `_checkpoints/`), lifecycle rules, pipeline IAM identity | S3 backend with native lockfile (no DynamoDB) |
+
+```bash
+cd terraform/bootstrap && terraform init && terraform apply
+cd ../lake
+cp backend.hcl.example backend.hcl        # set the state bucket from the bootstrap output
+terraform init -backend-config=backend.hcl && terraform apply
+aws iam create-access-key --user-name cdc-lakehouse-pipeline   # store it outside git
+```
+
+Choices worth calling out:
+
+- **No access keys in Terraform.** The pipeline user is managed in code, but its key is created with the
+  CLI so the secret never lands in Terraform state.
+- **Least privilege, verified.** The pipeline identity can read, write and delete only under the lake
+  prefixes. Writing to the bucket root, reading Terraform state, listing other buckets, IAM calls and
+  plain-HTTP requests are all denied.
+- **SSE-S3 instead of a customer-managed KMS key**, which would add a fixed monthly cost per key.
+- **No S3 versioning on the lake.** Delta Lake keeps its own table history; versioning would retain every
+  file that `VACUUM` deletes.
+- **Account id never hardcoded.** Bucket names are derived at plan time and the backend bucket comes from a
+  git-ignored `backend.hcl`.
+
 ## Roadmap
 
 - [x] Source data model and schema
 - [x] Architecture
 - [x] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
 - [x] Data generator with live changes
-- [ ] AWS infrastructure in Terraform (S3, IAM, Glue, Athena)
+- [x] AWS infrastructure in Terraform: S3 lake, remote state, least-privilege pipeline identity
+- [ ] Glue Data Catalog and Athena workgroup (Terraform)
 - [ ] Bronze and silver streaming jobs (Spark + Delta on S3)
 - [ ] Gold layer and data quality checks (Airflow)
 - [ ] AI agent tools over gold

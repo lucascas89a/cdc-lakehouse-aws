@@ -1,0 +1,3 @@
+# Copy to backend.hcl (git-ignored) and run: terraform init -backend-config=backend.hcl
+# Use the state_bucket output of the bootstrap stack.
+bucket = "cdc-lakehouse-tfstate-<account-id>"

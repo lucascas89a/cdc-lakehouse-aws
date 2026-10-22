@@ -23,3 +23,6 @@ logs/
 
 # Claude Code local notes
 .claude/
+
+# Terraform backend config (contains the account id)
+backend.hcl
