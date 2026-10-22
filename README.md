@@ -241,6 +241,42 @@ their prices) were **identical** in PostgreSQL and silver. The silver checkpoint
 full replay of 15,610 events: the metrics stayed identical, the history tables gained no rows and the
 replay `MERGE` reported 0 rows updated and 0 inserted.
 
+## Gold layer (write-audit-publish)
+
+`spark/jobs/gold_build.py` rebuilds six small business tables from silver, one per question the business
+asks. Nothing reaches consumers without passing the audit:
+
+```bash
+python jobs/gold_build.py build     # write every table to gold/_staging/
+python jobs/gold_build.py audit     # 25 checks; exits non-zero on any failure
+python jobs/gold_build.py publish   # replace each published table in one Delta commit
+```
+
+| Table | Answers |
+|---|---|
+| `daily_sales` | Orders, units and revenue by day, country and category |
+| `payment_provider_daily`, `payment_failure_reasons` | Payment failure rate by provider, and why payments fail |
+| `late_shipments` | Parcels delivered late or still open past the promised date |
+| `order_lead_times` | Hours to pay, to ship, in transit and end to end, per order |
+| `customer_ltv` | Orders, revenue and average order value per customer (no PII) |
+
+The audit checks non-empty tables, non-null and unique keys, business rules (failure rates in [0, 1],
+no negative durations, late parcels really late) and **reconciles revenue three ways** (silver order
+lines, `daily_sales`, `customer_ltv`). On its first run it blocked publication twice for real reasons: a
+source order whose header total did not match its lines (revenue is now always defined from lines, and
+such drift is reported), and late parcels whose rounded delay displayed as zero.
+
+**Querying with Athena.** Terraform creates the `shopflow_gold` Glue database and a `cdc-lakehouse`
+Athena workgroup (engine v3, results encrypted and expired after 7 days, 1 GB scan limit per query).
+`scripts/register-gold-tables.sh` registers the tables as native Delta tables, so Athena takes the schema
+from the transaction log instead of a hand-maintained column list.
+
+```sql
+SELECT provider, sum(failed) * 1.0 / sum(attempts) AS failure_rate
+FROM shopflow_gold.payment_provider_daily
+GROUP BY provider ORDER BY failure_rate DESC;
+```
+
 ## AWS infrastructure (Terraform)
 
 Two stacks under `terraform/`:
@@ -278,10 +314,11 @@ Choices worth calling out:
 - [x] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
 - [x] Data generator with live changes
 - [x] AWS infrastructure in Terraform: S3 lake, remote state, least-privilege pipeline identity
-- [ ] Glue Data Catalog and Athena workgroup (Terraform)
+- [x] Glue Data Catalog and Athena workgroup (Terraform) with gold tables registered from the Delta log
 - [x] Bronze streaming job (Kafka -> Delta on S3, exactly-once verified)
 - [x] Silver streaming job (MERGE by LSN, SCD2, status history, PII masking), reconciled with the source
-- [ ] Gold layer and data quality checks (Airflow)
+- [x] Gold layer with write-audit-publish and 25 data quality checks
+- [ ] Airflow orchestration (gold every 15 min, daily OPTIMIZE / VACUUM)
 - [ ] AI agent tools over gold
 - [ ] Demo video
 

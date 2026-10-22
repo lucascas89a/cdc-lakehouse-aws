@@ -21,7 +21,7 @@ from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
-from common import checkpoint_path, lake_path, spark_session
+from common import checkpoint_path, lake_path, spark_session, table_exists
 
 TRIGGER = os.environ.get("TRIGGER_INTERVAL", "2 minutes")
 PII_HASH_SALT = os.environ["PII_HASH_SALT"]
@@ -114,12 +114,6 @@ def mask_customers(df: DataFrame) -> DataFrame:
 
 
 # --- Writers ---------------------------------------------------------------------------
-
-def table_exists(spark: SparkSession, path: str) -> bool:
-    """Check only <path>/_delta_log. DeltaTable.isDeltaTable() also walks up parent directories,
-    which needs read access to the bucket root that the pipeline identity deliberately lacks."""
-    log_dir = spark._jvm.org.apache.hadoop.fs.Path(f"{path}/_delta_log")
-    return log_dir.getFileSystem(spark._jsc.hadoopConfiguration()).exists(log_dir)
 
 
 def upsert_current(spark: SparkSession, df: DataFrame, table: str) -> None:

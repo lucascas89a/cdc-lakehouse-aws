@@ -16,6 +16,13 @@ def checkpoint_path(query_name: str) -> str:
     return f"{LAKE}/_checkpoints/{query_name}"
 
 
+def table_exists(spark: SparkSession, path: str) -> bool:
+    """Check only <path>/_delta_log. DeltaTable.isDeltaTable() also walks up parent directories,
+    which needs read access to the bucket root that the pipeline identity deliberately lacks."""
+    log_dir = spark._jvm.org.apache.hadoop.fs.Path(f"{path}/_delta_log")
+    return log_dir.getFileSystem(spark._jsc.hadoopConfiguration()).exists(log_dir)
+
+
 def spark_session(app_name: str) -> SparkSession:
     return (
         SparkSession.builder.appName(app_name)
@@ -32,5 +39,6 @@ def spark_session(app_name: str) -> SparkSession:
         .config("spark.hadoop.fs.s3a.endpoint.region", os.environ.get("AWS_REGION", "us-east-1"))
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true")
         .config("spark.ui.port", "4040")
+        .config("spark.ui.showConsoleProgress", "false")   # keeps container and Airflow logs readable
         .getOrCreate()
     )
