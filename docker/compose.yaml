@@ -147,6 +147,24 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  spark-silver:
+    image: cdc-lakehouse/spark:local
+    profiles: [spark]
+    command: ["python", "jobs/silver_cdc.py"]
+    env_file: [aws-pipeline.env]
+    environment:
+      SPARK_DRIVER_MEMORY: 1g
+      TRIGGER_INTERVAL: ${SILVER_TRIGGER_INTERVAL:-2 minutes}
+      PII_HASH_SALT: ${PII_HASH_SALT:?set it in docker/.env}
+    ports: ["127.0.0.1:4041:4040"]       # Spark UI
+    read_only: true
+    tmpfs: ["/tmp:size=1g,exec", "/home/spark:size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    logging: *logging
+    restart: unless-stopped
+
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     profiles: [ui]

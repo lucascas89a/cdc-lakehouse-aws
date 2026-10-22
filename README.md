@@ -167,6 +167,7 @@ snapshot reads) and the source LSN, which the silver layer uses to apply changes
 | Kafka Connect + Debezium | `quay.io/debezium/connect:3.6.2.Final` | 1 GB |
 | Data generator (optional) | built from `generator/` | 128 MB |
 | Spark bronze job (optional) | built from `spark/` | 2 GB |
+| Spark silver job (optional) | same image | 2 GB |
 | kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
 
 Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
@@ -204,6 +205,41 @@ Design notes:
 - **Image built for reproducibility.** Spark 4.2.0, Delta 4.4.1 and hadoop-aws 3.5.0 jars are resolved at
   build time (no Maven access at runtime), skipping libraries Spark already ships and pinning Jackson to
   Spark's version to avoid classpath conflicts. Runs as a non-root user on a read-only filesystem.
+
+## Silver layer
+
+`spark/jobs/silver_cdc.py` streams from the bronze Delta table and, for every micro-batch, parses each
+source table's events and applies them with Delta `MERGE`:
+
+| Table | Shape | How it is maintained |
+|---|---|---|
+| `customers`, `orders`, `order_items`, `payments`, `shipments` | Current state, one row per key | Latest event per key in the batch; applied only if its LSN is newer than the stored one. Deletes are soft (`_is_deleted`) |
+| `products_history` | SCD Type 2 (`valid_from`, `valid_to`, `is_current`) | Closes the current version and inserts the new ones in a single MERGE |
+| `order_status_history` | One row per status transition | Derived from Debezium `before`/`after` images; insert-only MERGE on `(order_id, lsn)` |
+| `_rejects` | Unparseable events or events without a key | Kept for inspection instead of failing the stream |
+
+```bash
+docker compose -f docker/compose.yaml --profile spark up -d spark-bronze spark-silver
+```
+
+Design notes:
+
+- **Idempotent by construction.** Every write is either guarded by the source LSN or keyed on it, and
+  append-only writes use Delta's `txnAppId`/`txnVersion`. Re-running a micro-batch, or the whole history,
+  changes nothing.
+- **Soft deletes.** Keeping a tombstone row with its LSN stops a late or replayed event from
+  resurrecting a deleted row.
+- **PII never reaches silver in clear text.** `email` becomes a salted SHA-256 hash plus its domain, and
+  `full_name` is dropped. The salt is a secret outside the repository, so hashes can be joined on but not
+  reversed with a dictionary of known emails.
+- **Least privilege shaped the code.** `DeltaTable.isDeltaTable()` walks up to the bucket root looking for
+  a `_delta_log`, which the pipeline identity cannot read; the job checks `<table>/_delta_log` directly.
+
+**Reconciliation with the source.** After the pipeline caught up, 15 metrics (counts and amounts of
+orders by status, order lines, payments by status, shipments by status, customers, active products and
+their prices) were **identical** in PostgreSQL and silver. The silver checkpoint was then deleted to force a
+full replay of 15,610 events: the metrics stayed identical, the history tables gained no rows and the
+replay `MERGE` reported 0 rows updated and 0 inserted.
 
 ## AWS infrastructure (Terraform)
 
@@ -244,7 +280,7 @@ Choices worth calling out:
 - [x] AWS infrastructure in Terraform: S3 lake, remote state, least-privilege pipeline identity
 - [ ] Glue Data Catalog and Athena workgroup (Terraform)
 - [x] Bronze streaming job (Kafka -> Delta on S3, exactly-once verified)
-- [ ] Silver streaming job (MERGE, SCD2, PII masking)
+- [x] Silver streaming job (MERGE by LSN, SCD2, status history, PII masking), reconciled with the source
 - [ ] Gold layer and data quality checks (Airflow)
 - [ ] AI agent tools over gold
 - [ ] Demo video
