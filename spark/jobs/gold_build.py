@@ -7,16 +7,29 @@
 Gold tables are small aggregates, so each run rebuilds them in full from silver: simple,
 idempotent, and self-healing if silver is corrected. Consumers (Athena, the AI agent) only
 ever see data that passed the audit. Gold holds no PII.
+
+Silver keeps changing while this runs, so build pins the Delta version of every silver table it
+reads and records it in gold/_staging/_manifest; audit reconciles against exactly those versions
+(time travel), so a mismatch means a real defect and not silver having moved in between. The
+manifest lives under gold/ because the pipeline identity can only write bronze/, silver/, gold/
+and _checkpoints/. Time travel needs the pinned files, which VACUUM keeps for 168 h.
+
+Publish is atomic per table (one Delta commit each) but not across tables: while it runs, a
+reader can briefly see some tables from the new build and others from the previous one.
 """
 
 import sys
 
+from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from common import lake_path, spark_session
 
 STAGING = "_staging"
+MANIFEST = "_manifest"
+SILVER_TABLES = ["customers", "orders", "order_items", "payments", "shipments",
+                 "products_history", "order_status_history"]
 REVENUE_STATUSES = "('paid', 'shipped', 'delivered')"
 
 GOLD_SQL = {
@@ -133,33 +146,67 @@ KEYS = {
 MAY_BE_EMPTY = {"late_shipments", "payment_failure_reasons"}
 
 
-def register_silver(spark: SparkSession) -> None:
-    """Expose silver as views: live rows only, products at their current version."""
+def silver_versions(spark: SparkSession) -> dict[str, int]:
+    """Latest committed version of every silver table, read from the Delta log."""
+    return {t: DeltaTable.forPath(spark, lake_path("silver", t)).history(1).first().version
+            for t in SILVER_TABLES}
+
+
+def read_silver(spark: SparkSession, table: str, versions: dict[str, int] | None) -> DataFrame:
+    reader = spark.read.format("delta")
+    if versions is not None:
+        reader = reader.option("versionAsOf", versions[table])
+    return reader.load(lake_path("silver", table))
+
+
+def register_silver(spark: SparkSession, versions: dict[str, int] | None = None) -> None:
+    """Expose silver as views: live rows only, products at their current version.
+
+    With `versions`, every table is read at that Delta version so all queries see one snapshot.
+    """
     for table in ["customers", "orders", "order_items", "payments", "shipments"]:
-        (spark.read.format("delta").load(lake_path("silver", table))
-         .where("NOT _is_deleted").createOrReplaceTempView(table))
-    (spark.read.format("delta").load(lake_path("silver", "products_history"))
-     .where("is_current").createOrReplaceTempView("products"))
-    spark.read.format("delta").load(lake_path("silver", "order_status_history")).createOrReplaceTempView(
-        "order_status_history")
+        read_silver(spark, table, versions).where("NOT _is_deleted").createOrReplaceTempView(table)
+    read_silver(spark, "products_history", versions).where("is_current").createOrReplaceTempView("products")
+    read_silver(spark, "order_status_history", versions).createOrReplaceTempView("order_status_history")
 
 
 def staging(name: str) -> str:
     return lake_path("gold", f"{STAGING}/{name}")
 
 
+def write_manifest(spark: SparkSession, versions: dict[str, int]) -> None:
+    (spark.createDataFrame(sorted(versions.items()), "silver_table STRING, version BIGINT")
+     .withColumn("built_at", F.current_timestamp())
+     .write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(staging(MANIFEST)))
+
+
+def read_manifest(spark: SparkSession) -> dict[str, int]:
+    rows = spark.read.format("delta").load(staging(MANIFEST)).collect()
+    versions = {r.silver_table: r.version for r in rows}
+    missing = set(SILVER_TABLES) - versions.keys()
+    if missing:
+        sys.exit(f"manifest {staging(MANIFEST)} lacks versions for {sorted(missing)}; run build first")
+    return versions
+
+
 def build(spark: SparkSession) -> None:
-    register_silver(spark)
+    versions = silver_versions(spark)
+    print(f"silver versions: {versions}", flush=True)
+    register_silver(spark, versions)
     for name, sql in GOLD_SQL.items():
         df = spark.sql(sql)
         df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(staging(name))
         print(f"built {name}", flush=True)
+    # Written last: a manifest always describes a build whose staging tables were all written.
+    write_manifest(spark, versions)
 
 
 # --- Audit -----------------------------------------------------------------------------
 
 def audit(spark: SparkSession) -> bool:
-    register_silver(spark)
+    versions = read_manifest(spark)
+    print(f"auditing against silver versions: {versions}", flush=True)
+    register_silver(spark, versions)
     t = {name: spark.read.format("delta").load(staging(name)) for name in GOLD_SQL}
     results: list[tuple[str, bool, str]] = []
 
@@ -220,7 +267,11 @@ def audit(spark: SparkSession) -> bool:
 
 
 def publish(spark: SparkSession) -> None:
-    """Each table is replaced atomically (one Delta commit); readers never see a partial table."""
+    """Each table is replaced atomically (one Delta commit); readers never see a partial table.
+
+    Not atomic across tables: a failure halfway leaves some tables from this build and the rest
+    from the previous one. Rerunning publish (staging is untouched) converges again.
+    """
     for name in GOLD_SQL:
         df = spark.read.format("delta").load(staging(name))
         df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(lake_path("gold", name))

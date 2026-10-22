@@ -17,12 +17,32 @@ data "aws_iam_policy_document" "pipeline" {
       variable = "s3:prefix"
       values   = flatten([for p in local.lake_prefixes : [p, "${p}/*"]])
     }
+    # Optional source-IP pinning: a leaked access key is useless outside these CIDRs.
+    # Empty list (default) = no condition, so a fresh clone still works anywhere.
+    dynamic "condition" {
+      for_each = length(var.pipeline_allowed_cidrs) > 0 ? [1] : []
+      content {
+        test     = "IpAddress"
+        variable = "aws:SourceIp"
+        values   = var.pipeline_allowed_cidrs
+      }
+    }
   }
 
   statement {
     sid       = "ReadWriteLakeObjects"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"]
     resources = [for p in local.lake_prefixes : "${aws_s3_bucket.lake.arn}/${p}/*"]
+    # Optional source-IP pinning: a leaked access key is useless outside these CIDRs.
+    # Empty list (default) = no condition, so a fresh clone still works anywhere.
+    dynamic "condition" {
+      for_each = length(var.pipeline_allowed_cidrs) > 0 ? [1] : []
+      content {
+        test     = "IpAddress"
+        variable = "aws:SourceIp"
+        values   = var.pipeline_allowed_cidrs
+      }
+    }
   }
 }
 

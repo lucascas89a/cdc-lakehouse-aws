@@ -3,6 +3,17 @@
 Streaming writes produce many small files (one or more per micro-batch). Compaction keeps reads
 fast and S3 request counts low; VACUUM deletes files older than the retention window that no
 table version references any more, so time travel still works within that window.
+
+What the 168 h retention has to cover:
+* silver lag: OPTIMIZE on bronze marks the small files it compacts as removed, and the silver
+  stream still reads those original files for versions it has not processed yet. If silver falls
+  more than the retention behind, VACUUM deletes them and silver fails on restart (it would have to
+  be rebuilt from bronze with a fresh checkpoint). Keep silver outages well under 7 days.
+* Kafka retention is the other bound: bronze must catch up before Kafka drops the events.
+* gold audit reads silver by version (time travel); minutes apart, far inside the window.
+
+OPTIMIZE commits can conflict with silver's concurrent MERGEs; silver retries those conflicts,
+and a failed OPTIMIZE here is retried by the Airflow task.
 """
 
 import os

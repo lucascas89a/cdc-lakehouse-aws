@@ -7,15 +7,28 @@ Each micro-batch of bronze events is parsed per source table and applied with De
   out-of-order events are harmless. Deletes are soft (`_is_deleted`), which keeps a stale
   event from resurrecting a deleted row.
 * products_history: SCD Type 2, one row per version with valid_from / valid_to / is_current,
-  so revenue can be computed with the price that was valid at the time.
+  so revenue can be computed with the price that was valid at the time. Versions are keyed by
+  (product_id, _lsn) and valid_to / is_current are recomputed over every stored version of the
+  touched products, so the result does not depend on the order in which events arrive.
 * order_status_history: one row per status transition, built from before/after images.
+  Orders captured by the initial snapshot (op 'r') get a single transition (NULL -> their status
+  at snapshot time): their earlier history happened before CDC started and cannot be recovered.
 * PII: customer email is replaced by a salted SHA-256 hash plus its domain; names are dropped.
 
-Rows that cannot be parsed or have no key go to silver/_rejects instead of failing the stream.
+Event time is the source commit time (`_source_ts`, Debezium's source.ts_ms), not the row's
+updated_at: it follows the same order as the LSN and also exists for deletes.
+
+Kafka Connect is at-least-once, so the same change can reach bronze twice: every writer dedups
+on (key, _lsn) and every write is idempotent, which also makes retries and replays safe.
+
+Rows that cannot be parsed, have no key or hold a value that does not cast (a timestamp or amount
+that is not null at the source but null after try_cast) go to silver/_rejects with a reason,
+instead of failing the stream.
 """
 
 import logging
 import os
+import time
 
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession, Window
@@ -52,17 +65,26 @@ MONEY = "DECIMAL(12,2)"
 TIMESTAMPS = {"created_at", "updated_at", "promised_at", "shipped_at", "delivered_at"}
 MONEY_COLUMNS = {"unit_price", "total_amount", "amount"}
 META = ["_op", "_lsn", "_source_ts", "_is_deleted", "_processed_at"]
+REJECT_KEY = ["kafka_topic", "kafka_partition", "kafka_offset"]
+
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 5
+# Delta optimistic-concurrency failures (e.g. a MERGE racing the daily OPTIMIZE). Matched by name
+# because PySpark surfaces them as Py4JJavaError / AnalysisException wrapping the Java exception.
+CONFLICT_MARKERS = ("ConcurrentModification", "ConcurrentAppend", "ConcurrentDeleteRead",
+                    "ConcurrentDeleteDelete", "ConcurrentTransaction", "MetadataChanged",
+                    "ProtocolChanged", "DELTA_CONCURRENT")
 
 
 # --- Parsing ---------------------------------------------------------------------------
 
 def parse(batch: DataFrame, table: str) -> tuple[DataFrame, DataFrame]:
-    """Return (parsed rows with typed columns + before image, rejected rows)."""
+    """Return (parsed rows with typed columns + before image, rejected rows with a reason)."""
     envelope = (f"STRUCT<before: STRUCT<{SCHEMAS[table]}>, after: STRUCT<{SCHEMAS[table]}>, "
                 f"op: STRING, source: STRUCT<lsn: BIGINT, ts_ms: BIGINT>>")
     events = (
         batch.where(F.col("source_table") == table)
-        .select("payload", "kafka_offset", F.from_json("payload", envelope).alias("e"))
+        .select("payload", *REJECT_KEY, F.from_json("payload", envelope).alias("e"))
     )
     # Deletes carry only `before`; everything else carries `after`.
     row = F.coalesce(F.col("e.after"), F.col("e.before"))
@@ -70,31 +92,38 @@ def parse(batch: DataFrame, table: str) -> tuple[DataFrame, DataFrame]:
     for k in KEYS[table]:
         key_present = key_present & row[k].isNotNull()
 
-    good = events.where(F.col("e").isNotNull() & key_present)
-    rejected = (events.where(F.col("e").isNull() | ~key_present)
-                .select(F.lit(table).alias("source_table"), "payload", "kafka_offset",
-                        F.current_timestamp().alias("_rejected_at")))
-
-    columns = []
-    for field in good.select(row.alias("r")).schema["r"].dataType.fields:
-        c = F.col(f"r.{field.name}")
+    # try_cast: a malformed value becomes a reject instead of an ANSI cast error that kills the stream.
+    typed, bad_values = {}, []
+    for field in events.select(row.alias("r")).schema["r"].dataType.fields:
+        source = row[field.name]
         if field.name in TIMESTAMPS:
-            c = c.cast("timestamp")
+            c = source.try_cast("timestamp")
         elif field.name in MONEY_COLUMNS:
-            c = c.cast(MONEY)
-        columns.append(c.alias(field.name))
+            c = source.try_cast(MONEY)
+        else:
+            c = source
+        if c is not source:
+            bad_values.append(F.when(source.isNotNull() & c.isNull(), F.lit(field.name)))
+        typed[field.name] = c
+    bad = F.concat_ws(", ", *bad_values) if bad_values else F.lit("")
+
+    reason = (F.when(row.isNull(), F.lit("unparseable payload"))
+              .when(~key_present, F.lit("missing key"))
+              .when(bad != "", F.concat(F.lit("invalid value in "), bad)))
+    events = events.withColumn("_reason", reason)
+
+    good = events.where(F.col("_reason").isNull())
+    rejected = (events.where(F.col("_reason").isNotNull())
+                .select(F.lit(table).alias("source_table"), *REJECT_KEY, "payload",
+                        F.col("_reason").alias("reason"), F.current_timestamp().alias("_rejected_at")))
 
     parsed = good.select(
-        row.alias("r"),
+        *[c.alias(name) for name, c in typed.items()],
         F.col("e.before").alias("_before"),
         F.col("e.op").alias("_op"),
         F.col("e.source.lsn").alias("_lsn"),
         (F.col("e.source.ts_ms") / 1000).cast("timestamp").alias("_source_ts"),
-        "kafka_offset",
-    ).select(
-        *columns,
-        "_before", "_op", "_lsn", "_source_ts",
-        (F.col("_op") == "d").alias("_is_deleted"),
+        (F.col("e.op") == "d").alias("_is_deleted"),
         F.current_timestamp().alias("_processed_at"),
         "kafka_offset",
     )
@@ -133,15 +162,19 @@ def upsert_current(spark: SparkSession, df: DataFrame, table: str) -> None:
 
 
 def append_status_history(spark: SparkSession, orders: DataFrame) -> None:
-    """One row per order status transition (creation counts as a transition from NULL)."""
-    transitions = orders.where(
+    """One row per order status transition (creation counts as a transition from NULL).
+
+    Snapshot rows (op 'r') only know the status at snapshot time, so pre-CDC orders get a
+    single transition. Insert-only on (order_id, _lsn): replays and duplicates add nothing.
+    """
+    transitions = orders.dropDuplicates(KEYS["orders"] + ["_lsn"]).where(
         F.col("_op").isin("c", "r")
         | ((F.col("_op") == "u") & ~F.col("_before.status").eqNullSafe(F.col("status")))
     ).select(
         "order_id",
         F.when(F.col("_op") == "u", F.col("_before.status")).alias("from_status"),
         F.col("status").alias("to_status"),
-        F.col("updated_at").alias("changed_at"),
+        F.col("_source_ts").alias("changed_at"),
         "_lsn",
         "_processed_at",
     )
@@ -156,44 +189,91 @@ def append_status_history(spark: SparkSession, orders: DataFrame) -> None:
 
 
 def apply_products_scd2(spark: SparkSession, products: DataFrame) -> None:
-    """SCD Type 2: close the current version and insert the new ones, in a single MERGE."""
+    """SCD Type 2 keyed by (product_id, _lsn), independent of arrival order.
+
+    New versions are combined with every stored version of the products they touch, valid_to
+    (next version's valid_from by LSN) and is_current are recomputed over the full sequence, and
+    a single MERGE inserts the new versions and fixes the stored ones whose window changed. One
+    commit, so readers never see a product with zero or two current versions. A replay finds
+    every version already stored with the same window and changes nothing.
+    """
     path = lake_path("silver", "products_history")
-    versions = products.drop("_before", "kafka_offset").withColumn("valid_from", F.col("updated_at"))
-
-    if table_exists(spark, path):
-        current = (spark.read.format("delta").load(path).where("is_current")
-                   .select("product_id", F.col("_lsn").alias("_current_lsn")))
-        # Skip anything already applied: makes replays of the same micro-batch a no-op.
-        versions = (versions.join(current, "product_id", "left")
-                    .where(F.col("_current_lsn").isNull() | (F.col("_lsn") > F.col("_current_lsn")))
-                    .drop("_current_lsn"))
-
+    versions = (products.drop("_before", "kafka_offset")
+                .dropDuplicates(KEYS["products"] + ["_lsn"])
+                .withColumn("valid_from", F.col("_source_ts")))
     w = Window.partitionBy("product_id").orderBy("_lsn")
-    versions = (versions.withColumn("valid_to", F.lead("valid_from").over(w))
-                .withColumn("is_current", F.col("valid_to").isNull()))
 
     if not table_exists(spark, path):
-        versions.write.format("delta").save(path)
+        (versions.withColumn("valid_to", F.lead("valid_from").over(w))
+         .withColumn("is_current", F.col("valid_to").isNull())
+         .write.format("delta").save(path))
         return
 
-    first_new = versions.withColumn("_rn", F.row_number().over(w)).where("_rn = 1").drop("_rn")
-    staged = (versions.withColumn("_merge_key", F.lit(None).cast("bigint"))
-              .unionByName(first_new.withColumn("_merge_key", F.col("product_id"))))
-    insert_values = {c: f"s.{c}" for c in versions.columns}
+    touched = versions.select("product_id").distinct()
+    stored = (spark.read.format("delta").load(path).join(F.broadcast(touched), "product_id")
+              .withColumnRenamed("valid_to", "_old_valid_to")
+              .withColumnRenamed("is_current", "_old_is_current"))
+    new = versions.join(stored.select("product_id", "_lsn"), ["product_id", "_lsn"], "left_anti")
+    changes = (stored.withColumn("_stored", F.lit(True))
+               .unionByName(new.withColumn("_stored", F.lit(False)), allowMissingColumns=True)
+               .withColumn("valid_to", F.lead("valid_from").over(w))
+               .withColumn("is_current", F.col("valid_to").isNull())
+               .where(~F.col("_stored")
+                      | ~F.col("valid_to").eqNullSafe(F.col("_old_valid_to"))
+                      | ~F.col("is_current").eqNullSafe(F.col("_old_is_current"))))
+
+    insert_values = {c: f"s.{c}" for c in versions.columns + ["valid_to", "is_current"]}
     (DeltaTable.forPath(spark, path).alias("t")
-     .merge(staged.alias("s"), "t.product_id = s._merge_key AND t.is_current")
-     .whenMatchedUpdate(set={"is_current": "false", "valid_to": "s.valid_from"})
-     .whenNotMatchedInsert(condition="s._merge_key IS NULL", values=insert_values)
+     .merge(changes.alias("s"), "t.product_id = s.product_id AND t._lsn = s._lsn")
+     .whenMatchedUpdate(set={"valid_to": "s.valid_to", "is_current": "s.is_current"})
+     .whenNotMatchedInsert(values=insert_values)
      .execute())
 
 
-def write_rejects(rejected: DataFrame, table: str, batch_id: int) -> None:
-    """Append-only, made idempotent per micro-batch with Delta's txnAppId/txnVersion."""
-    if not rejected.isEmpty():
-        (rejected.write.format("delta").mode("append")
-         .option("txnAppId", f"{QUERY_NAME}_rejects_{table}").option("txnVersion", batch_id)
-         .save(lake_path("silver", "_rejects")))
-        print(f"rejected {rejected.count()} events from {table}", flush=True)
+def write_rejects(spark: SparkSession, rejected: DataFrame, table: str) -> None:
+    """Insert-only on the Kafka coordinates, so it stays idempotent even if the checkpoint is reset."""
+    rejected = rejected.dropDuplicates(REJECT_KEY)
+    n = rejected.count()
+    if not n:
+        return
+    path = lake_path("silver", "_rejects")
+    if not table_exists(spark, path):
+        rejected.write.format("delta").save(path)
+    else:
+        on = " AND ".join(f"t.{k} = s.{k}" for k in REJECT_KEY)
+        # Schema evolution adds kafka_topic / kafka_partition / reason to a table created before them.
+        (DeltaTable.forPath(spark, path).alias("t")
+         .merge(rejected.alias("s"), on)
+         .withSchemaEvolution()
+         .whenNotMatchedInsertAll()
+         .execute())
+    print(f"rejected {n} events from {table}", flush=True)
+
+
+def with_retries(action, what: str) -> None:
+    """Retry on Delta write conflicts only; safe because every writer is idempotent."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            action()
+            return
+        except Exception as exc:
+            text = f"{type(exc).__name__}: {exc}"
+            if attempt == MAX_ATTEMPTS or not any(m in text for m in CONFLICT_MARKERS):
+                raise
+            delay = RETRY_BACKOFF_SECONDS * attempt
+            print(f"concurrent write conflict on {what} (attempt {attempt}/{MAX_ATTEMPTS}), "
+                  f"retrying in {delay}s", flush=True)
+            time.sleep(delay)
+
+
+def apply_table(spark: SparkSession, parsed: DataFrame, rejected: DataFrame, table: str) -> None:
+    write_rejects(spark, rejected, table)
+    if table == "products":
+        apply_products_scd2(spark, parsed)
+    else:
+        if table == "orders":
+            append_status_history(spark, parsed)
+        upsert_current(spark, mask_customers(parsed) if table == "customers" else parsed, table)
 
 
 # --- Stream ----------------------------------------------------------------------------
@@ -207,13 +287,7 @@ def process_batch(batch: DataFrame, batch_id: int) -> None:
             continue
         parsed, rejected = parse(batch, table)
         parsed = parsed.persist()
-        write_rejects(rejected, table, batch_id)
-        if table == "products":
-            apply_products_scd2(spark, parsed)
-        else:
-            if table == "orders":
-                append_status_history(spark, parsed)
-            upsert_current(spark, mask_customers(parsed) if table == "customers" else parsed, table)
+        with_retries(lambda: apply_table(spark, parsed, rejected, table), table)
         parsed.unpersist()
     batch.unpersist()
     # print, not logging: this runs on the Py4J callback thread, where log records were not showing up.

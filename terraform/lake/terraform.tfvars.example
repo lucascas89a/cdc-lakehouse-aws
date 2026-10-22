@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (git-ignored) and adjust. terraform.tfvars is loaded automatically.
+
+# Restrict the pipeline IAM user to the VM's public IP. Find it on the VM with:
+#   curl -s https://checkip.amazonaws.com
+# Leave the list empty to disable the restriction.
+pipeline_allowed_cidrs = ["203.0.113.10/32"]

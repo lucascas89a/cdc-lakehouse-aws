@@ -14,3 +14,14 @@ variable "athena_results_retention_days" {
   type        = number
   default     = 7
 }
+
+variable "pipeline_allowed_cidrs" {
+  description = "Public CIDRs the pipeline IAM user may call S3 from (e.g. the VM's IP as /32). Empty = no IP restriction."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for c in var.pipeline_allowed_cidrs : can(cidrhost(c, 0))])
+    error_message = "Each entry must be a valid CIDR, e.g. 203.0.113.10/32."
+  }
+}

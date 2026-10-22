@@ -1,0 +1,17 @@
+# Keep the build context minimal and free of secrets/local state.
+.git
+.gitignore
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+.venv
+**/.env
+**/.env.*
+**/*.env
+**/secrets
+**/*.pem
+**/*.key
+**/*.tfstate*
+**/*.tfvars
+.dockerignore
+Dockerfile

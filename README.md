@@ -110,12 +110,21 @@ flowchart LR
 
 ## Security
 
-- No long-lived AWS keys for humans; the pipeline uses an IAM identity scoped to
-  the lake bucket only, and the agent uses a read-only identity scoped to gold and
-  Athena.
-- S3 bucket: encryption at rest, public access blocked, TLS enforced.
-- Secrets live in an untracked `.env`, never in the repository.
-- PII (`email`, `full_name`) is hashed in silver; gold contains no PII.
+- **No long-lived AWS keys for humans** (`aws login` sessions with MFA). The pipeline identity can only
+  touch the lake prefixes, and only from the VM's public IP (`aws:SourceIp`, set in a git-ignored
+  `terraform.tfvars`): a leaked key is useless anywhere else.
+- **S3:** encryption at rest, public access blocked, TLS enforced, Athena scans capped at 1 GB per query.
+- **Containers:** every port bound to `127.0.0.1`; Spark, generator and Airflow run as non-root on a
+  read-only filesystem with no capabilities; `no-new-privileges` everywhere. Airflow runs Spark
+  in-process instead of getting the Docker socket (which would be root on the host).
+- **Databases:** one role per purpose (Debezium: replication + read; generator: DML only; Airflow: its own
+  database), `CONNECT` revoked from `PUBLIC`.
+- **Secrets** live in untracked files (`docker/.env`, `docker/secrets/`), never in the repository or in
+  Terraform state. The Airflow UI password comes from a mounted file, so it is never printed to logs.
+  Kafka Connect's env config provider is allow-listed to the one variable it needs.
+- **PII** (`email`, `full_name`) is pseudonymised in silver; gold contains no PII.
+- Reviewed with an independent security pass before publishing; the findings and fixes are in the
+  commit history.
 
 ## Cost
 
@@ -168,6 +177,7 @@ snapshot reads) and the source LSN, which the silver layer uses to apply changes
 | Data generator (optional) | built from `generator/` | 128 MB |
 | Spark bronze job (optional) | built from `spark/` | 2 GB |
 | Spark silver job (optional) | same image | 2 GB |
+| Airflow (optional) | built from `airflow/` on the Spark image | 3 GB |
 | kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
 
 Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
@@ -224,22 +234,31 @@ docker compose -f docker/compose.yaml --profile spark up -d spark-bronze spark-s
 
 Design notes:
 
-- **Idempotent by construction.** Every write is either guarded by the source LSN or keyed on it, and
-  append-only writes use Delta's `txnAppId`/`txnVersion`. Re-running a micro-batch, or the whole history,
-  changes nothing.
+- **Idempotent by construction.** Every write is either guarded by the source LSN or keyed on it
+  (rejects on `(topic, partition, offset)`), and duplicates from Kafka Connect's at-least-once delivery
+  are dropped before the history MERGEs. Re-running a micro-batch, or the whole history, changes nothing.
+- **Order-independent history.** SCD2 versions are inserted by `(product_id, lsn)` and `valid_to` /
+  `is_current` are recomputed for every touched product in the same MERGE, so replays that read bronze
+  files in a different order (e.g. after `OPTIMIZE`) still produce the same history. Time columns use the
+  commit timestamp, consistent with LSN order.
+- **Poison pills go to `_rejects`, not down the stream.** Values that cannot be cast (`try_cast`) or
+  payloads that are not JSON are kept with a `reason`. Delta concurrency conflicts (e.g. with `OPTIMIZE`)
+  are retried, which is safe because every write is idempotent.
 - **Soft deletes.** Keeping a tombstone row with its LSN stops a late or replayed event from
   resurrecting a deleted row.
 - **PII never reaches silver in clear text.** `email` becomes a salted SHA-256 hash plus its domain, and
-  `full_name` is dropped. The salt is a secret outside the repository, so hashes can be joined on but not
-  reversed with a dictionary of known emails.
+  `full_name` is dropped. This is pseudonymisation, not anonymisation: the salt is a secret outside the
+  repository, and whoever holds it could test candidate emails.
 - **Least privilege shaped the code.** `DeltaTable.isDeltaTable()` walks up to the bucket root looking for
   a `_delta_log`, which the pipeline identity cannot read; the job checks `<table>/_delta_log` directly.
 
-**Reconciliation with the source.** After the pipeline caught up, 15 metrics (counts and amounts of
-orders by status, order lines, payments by status, shipments by status, customers, active products and
-their prices) were **identical** in PostgreSQL and silver. The silver checkpoint was then deleted to force a
-full replay of 15,610 events: the metrics stayed identical, the history tables gained no rows and the
-replay `MERGE` reported 0 rows updated and 0 inserted.
+**Reconciliation with the source.** After about 3 hours of live traffic (~200,000 change events, ~9,900
+orders), 15 metrics (counts and amounts of orders by status, order lines, payments by status, shipments by
+status, customers, active products and their prices) were **identical** in PostgreSQL and silver, with
+exactly one current version per product, contiguous `valid_from`/`valid_to` chains and no duplicate status
+transitions. The silver checkpoint was then deleted to force a full replay: every MERGE reported 0 rows
+inserted, updated or deleted. Two deliberately malformed events injected into Kafka ended up in `_rejects`
+with their reason, and the stream kept running.
 
 ## Gold layer (write-audit-publish)
 
@@ -276,6 +295,30 @@ SELECT provider, sum(failed) * 1.0 / sum(attempts) AS failure_rate
 FROM shopflow_gold.payment_provider_daily
 GROUP BY provider ORDER BY failure_rate DESC;
 ```
+
+## Orchestration (Airflow)
+
+Airflow 3.3.2 runs as a single container built **on top of the Spark image**, so tasks run the Spark jobs
+in-process and Airflow never gets the Docker socket. `airflow standalone` (scheduler, API server, DAG
+processor, triggerer) with the `LocalExecutor` and its metadata in its own PostgreSQL database: a
+single-node setup sized for the demo VM, with `parallelism=1` so two Spark JVMs never compete for memory.
+
+| DAG | Schedule | Tasks |
+|---|---|---|
+| `gold_pipeline` | every 15 min | `build` -> `audit` -> `publish` (audit never retried: a data problem does not fix itself) |
+| `lake_maintenance` | daily 06:30 UTC | `OPTIMIZE` + `VACUUM` (168 h) on bronze, silver and gold |
+
+```bash
+mkdir -m 700 docker/secrets
+printf '{"lucas": "%s"}\n' "$(openssl rand -base64 18)" > docker/secrets/airflow_passwords.json
+chmod 644 docker/secrets/airflow_passwords.json   # readable by the container user; the dir stays 700
+docker compose -f docker/compose.yaml --profile spark build spark-bronze   # Airflow's base image
+docker compose -f docker/compose.yaml --profile airflow up -d airflow       # UI on http://localhost:8085
+```
+
+`build` pins the silver table versions in a manifest and `audit` time-travels to those same versions, so
+the checks compare like with like even while silver keeps streaming. Verified by letting silver commit new
+versions between `build` and `audit`: the audit used the pinned versions and passed 25/25.
 
 ## AWS infrastructure (Terraform)
 
@@ -318,7 +361,8 @@ Choices worth calling out:
 - [x] Bronze streaming job (Kafka -> Delta on S3, exactly-once verified)
 - [x] Silver streaming job (MERGE by LSN, SCD2, status history, PII masking), reconciled with the source
 - [x] Gold layer with write-audit-publish and 25 data quality checks
-- [ ] Airflow orchestration (gold every 15 min, daily OPTIMIZE / VACUUM)
+- [x] Airflow orchestration (gold every 15 min, daily OPTIMIZE / VACUUM)
+- [x] Independent security and data-correctness review, findings fixed
 - [ ] AI agent tools over gold
 - [ ] Demo video
 

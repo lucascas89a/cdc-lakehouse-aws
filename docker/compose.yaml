@@ -27,10 +27,14 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in docker/.env}
       DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:?set it in docker/.env}
       GENERATOR_PASSWORD: ${GENERATOR_PASSWORD:?set it in docker/.env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set it in docker/.env}
     volumes:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - pg_data:/var/lib/postgresql/data
     ports: ["127.0.0.1:5433:5432"]
+    # The daemon already sets no-new-privileges; explicit here so it survives a daemon change.
+    # No cap_drop: the entrypoint needs root caps (chown, setuid) to step down to postgres.
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U shopflow_admin -d shopflow"]
       interval: 10s
@@ -63,6 +67,7 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     ports: ["127.0.0.1:9092:9092"]
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD-SHELL", "KAFKA_HEAP_OPTS=-Xmx64m /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 15s
@@ -94,9 +99,14 @@ services:
       # Connector configs reference ${env:DEBEZIUM_PASSWORD} instead of embedding the secret.
       CONNECT_CONFIG_PROVIDERS: env
       CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      # Only this variable is resolvable: a connector config submitted through the REST API
+      # cannot exfiltrate other env vars (e.g. ${env:HOSTNAME} or future secrets) into a topic.
+      # Becomes config.providers.env.param.allowlist.pattern ($$ escapes compose interpolation).
+      CONNECT_CONFIG_PROVIDERS_ENV_PARAM_ALLOWLIST_PATTERN: ^DEBEZIUM_PASSWORD$$
       DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:?set it in docker/.env}
       HEAP_OPTS: -Xms256m -Xmx512m
     ports: ["127.0.0.1:8083:8083"]
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD-SHELL", "curl -fs http://localhost:8083/ >/dev/null"]
       interval: 15s
@@ -165,6 +175,58 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  airflow:
+    build: ../airflow
+    image: cdc-lakehouse/airflow:local
+    profiles: [airflow]
+    depends_on:
+      postgres: { condition: service_healthy }
+    env_file: [aws-pipeline.env]          # Spark tasks write to the lake as the pipeline IAM user
+    # Trade-off: secrets passed as env vars are visible to anyone who can run `docker inspect`
+    # (i.e. root or the docker group). On this single-user VPS that is already host-root, so it
+    # adds no exposure; on a shared host move them to files under secrets/ instead.
+    # Airflow 3.3 opens the passwords file read-write (flock + append), so the read-only mount is
+    # copied to the tmpfs first. With the user present in the file, no password is generated or
+    # printed to the logs.
+    command:
+      - sh
+      - -c
+      - install -m 600 /run/secrets/airflow_passwords.json /tmp/airflow_passwords.json && exec airflow standalone
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__PARALLELISM: 1        # never two Spark JVMs at once on a small VM
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set it in docker/.env}
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: lucas:admin
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /tmp/airflow_passwords.json
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?set it in docker/.env}@postgres/airflow
+      AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET:?set it in docker/.env}
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set it in docker/.env}
+      AIRFLOW__API__PORT: 8080
+      SPARK_DRIVER_MEMORY: 1g
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags:ro
+      - airflow_home:/opt/airflow
+      # Create it once on the host (dir 700 guards it there; file 644 so uid 10001 can read it):
+      #   install -d -m 700 secrets
+      #   printf '{"lucas": "%s"}\n' "$(openssl rand -base64 24)" > secrets/airflow_passwords.json
+      #   chmod 644 secrets/airflow_passwords.json
+      # Long syntax with create_host_path: false so a missing file fails instead of becoming a dir.
+      - type: bind
+        source: ./secrets/airflow_passwords.json
+        target: /run/secrets/airflow_passwords.json
+        read_only: true
+        bind: { create_host_path: false }
+    ports: ["127.0.0.1:8085:8080"]       # Airflow UI
+    read_only: true
+    tmpfs: ["/tmp:size=1g,exec", "/home/spark:size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 3g
+    logging: *logging
+    restart: unless-stopped
+
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     profiles: [ui]
@@ -177,6 +239,8 @@ services:
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
       JAVA_OPTS: -Xmx256m
     ports: ["127.0.0.1:8090:8080"]
+    cap_drop: [ALL]                       # runs as non-root kafkaui and needs no capabilities
+    security_opt: [no-new-privileges:true]
     mem_limit: 512m
     logging: *logging
     restart: unless-stopped
@@ -184,3 +248,4 @@ services:
 volumes:
   pg_data:
   kafka_data:
+  airflow_home:
