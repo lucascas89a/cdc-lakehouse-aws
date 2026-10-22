@@ -20,3 +20,6 @@ data/
 checkpoints/
 spark-warehouse/
 logs/
+
+# Claude Code local notes
+.claude/
