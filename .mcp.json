@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "shopflow-gold": {
+      "command": "docker",
+      "args": ["compose", "-f", "docker/compose.yaml", "--profile", "agent",
+               "run", "--rm", "--no-deps", "-i", "-T", "agent"]
+    }
+  }
+}

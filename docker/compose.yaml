@@ -227,6 +227,21 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  agent:
+    build: ../agent
+    image: cdc-lakehouse/agent:local
+    profiles: [agent]
+    # MCP server over stdio, started by the MCP client (see .mcp.json):
+    #   docker compose -f docker/compose.yaml run --rm -i --no-deps agent
+    env_file: [aws-agent.env]             # read-only agent IAM user (Athena only), git-ignored
+    stdin_open: true
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    logging: *logging
+
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     profiles: [ui]

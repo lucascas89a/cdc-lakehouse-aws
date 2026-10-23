@@ -178,6 +178,7 @@ snapshot reads) and the source LSN, which the silver layer uses to apply changes
 | Spark bronze job (optional) | built from `spark/` | 2 GB |
 | Spark silver job (optional) | same image | 2 GB |
 | Airflow (optional) | built from `airflow/` on the Spark image | 3 GB |
+| Agent MCP server (on demand) | built from `agent/` | 256 MB |
 | kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
 
 Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
@@ -320,6 +321,49 @@ docker compose -f docker/compose.yaml --profile airflow up -d airflow       # UI
 the checks compare like with like even while silver keeps streaming. Verified by letting silver commit new
 versions between `build` and `audit`: the audit used the pinned versions and passed 25/25.
 
+## AI agent tools (MCP)
+
+`agent/` is an [MCP](https://modelcontextprotocol.io) server that lets any MCP client (Claude Code, Claude
+Desktop, an agent framework) answer business questions from the gold layer. The agent never writes SQL:
+it gets eight fixed, read-only tools, one per business question, designed in
+[docs/agent-tools.md](docs/agent-tools.md).
+
+| Tool | Question |
+|---|---|
+| `get_sales_summary` | How much did we sell, by day, country and category? |
+| `get_payment_failure_rate`, `get_payment_failure_reasons` | Which share of payments fail, with which provider, and why? |
+| `get_late_shipments`, `get_late_shipments_by_carrier` | Which parcels are overdue, and which carriers are behind? |
+| `get_order_lead_times` | How long does an order take to pay, ship and deliver (avg, p50, p90)? |
+| `get_top_customers_ltv` | Who are the most valuable customers (by id only)? |
+| `data_freshness` | How current is the data? |
+
+```bash
+docker compose -f docker/compose.yaml --profile agent build agent
+claude   # from the repo root: .mcp.json registers the server, then just ask a question
+```
+
+Guardrails, all enforced in code and tested offline (`python -m unittest test_tools`):
+
+- **No free-form SQL.** Arguments are validated against closed lists and ranges (countries, providers,
+  carriers, dates up to 92 days, at most 50 rows) before any query runs, and values reach Athena as
+  `ExecutionParameters`, never by string concatenation. Invalid arguments are rejected by the MCP schema.
+- **Least privilege, enforced by IAM, not by the prompt.** The `cdc-lakehouse-agent` identity can only run
+  Athena queries in the `cdc-lakehouse` workgroup (1 GB scan cap) from the VM's IP. Glue and S3 access is
+  granted only when Athena makes the call on its behalf (`aws:CalledVia`), so the key cannot download lake
+  files, and staging, silver and bronze are explicitly denied. Verified: queries on gold succeed; direct
+  S3, direct Glue, other workgroups and IAM calls are denied.
+- **No PII.** Customers are returned by `customer_id` only; the customer tool's column list never includes
+  emails or email domains.
+- **Honest answers.** Every result carries notes on units (USD, fractions, compressed simulation clock),
+  known gaps (late parcels have no on-time denominator) and freshness, and empty results are flagged as
+  "no data", not zero.
+
+Example, asked to Claude Code with only these tools enabled: *"Which carriers have the most parcels
+currently overdue in Argentina, and how fresh is the data?"*. The agent called the tools, ranked OCA and
+Andreani first, pointed out that this ranks by volume rather than rate, converted the compressed clock to
+simulated hours and stated that the data was as of the last gold build. It also noticed that carriers from
+other countries were delivering in Argentina, a quirk of the data generator now tracked in the roadmap.
+
 ## AWS infrastructure (Terraform)
 
 Two stacks under `terraform/`:
@@ -363,7 +407,9 @@ Choices worth calling out:
 - [x] Gold layer with write-audit-publish and 25 data quality checks
 - [x] Airflow orchestration (gold every 15 min, daily OPTIMIZE / VACUUM)
 - [x] Independent security and data-correctness review, findings fixed
-- [ ] AI agent tools over gold
+- [x] AI agent tools over gold (MCP server, read-only Athena identity)
+- [ ] Generator: carriers consistent with the customer's country
+- [ ] Gold: shipments_daily (on-time denominator for late rates) and build metadata for freshness
 - [ ] Demo video
 
 ## Repository layout
@@ -375,7 +421,7 @@ scripts/     Helper scripts
 terraform/   AWS infrastructure
 spark/       Streaming and batch jobs
 airflow/     DAGs
-agent/       AI agent tools over the gold layer
+agent/       MCP server with read-only AI agent tools over gold
 docs/        Data model and design notes
 ```
 
