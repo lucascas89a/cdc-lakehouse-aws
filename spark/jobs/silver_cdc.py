@@ -301,6 +301,9 @@ def main() -> None:
 
     bronze = (spark.readStream.format("delta")
               .option("maxFilesPerTrigger", 1000)
+              # Bronze is append-only; the only rewrites are admin corrections (e.g. purging test
+              # events), which must not stop the stream or be replayed into silver.
+              .option("skipChangeCommits", "true")
               .load(lake_path("bronze", "cdc_events")))
     query = (bronze.writeStream.queryName(QUERY_NAME)
              .foreachBatch(process_batch)
