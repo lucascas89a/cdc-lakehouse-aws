@@ -1,139 +1,141 @@
 # cdc-lakehouse-aws
 
-Real-time change data capture from PostgreSQL into a Delta Lake lakehouse on Amazon S3,
-with a gold layer that dashboards and AI agents can query safely.
+🌎 Español | [English](README.en.md)
 
-> **Status:** work in progress. See [Roadmap](#roadmap).
+Captura de cambios (CDC) en tiempo real desde PostgreSQL hacia un lakehouse con Delta Lake en Amazon S3,
+con una capa gold que dashboards y agentes de IA pueden consultar de forma segura.
 
-## Why this project
+> **Estado:** en desarrollo. Ver [Roadmap](#roadmap).
 
-Most small companies want to "add AI" on top of data that lives in an operational
-database, gets exported by nightly scripts, and nobody fully trusts. This project
-shows an end-to-end alternative that a startup can run without a data team:
+## Por qué este proyecto
 
-- Every insert, update and delete in the source database is captured within seconds.
-- History is kept (order status transitions, price changes), not overwritten.
-- PII never leaves the silver layer unmasked.
-- The gold layer is cheap to query on AWS and exposed to an AI agent through
-  narrow, read-only tools instead of raw database access.
+La mayoría de las empresas pequeñas quieren "sumar IA" sobre datos que viven en una base de datos
+operativa, se exportan con scripts nocturnos y en los que nadie confía del todo. Este proyecto
+muestra una alternativa de punta a punta que una startup puede operar sin un equipo de datos:
 
-The example domain is **ShopFlow**, a fictional LATAM e-commerce. See
+- Cada insert, update y delete en la base de datos de origen se captura en segundos.
+- Se conserva el historial (cambios de estado de pedidos, cambios de precio), en lugar de sobrescribirlo.
+- Los datos personales (PII) nunca salen de la capa silver sin enmascarar.
+- La capa gold es económica de consultar en AWS y se expone a un agente de IA mediante
+  herramientas acotadas y de solo lectura, en lugar de dar acceso directo a la base de datos.
+
+El dominio de ejemplo es **ShopFlow**, un e-commerce ficticio de LATAM. Ver
 [docs/data-model.md](docs/data-model.md).
 
-## Architecture
+## Arquitectura
 
 ```mermaid
 flowchart LR
-    subgraph SRC["Source (Docker)"]
-        GEN["Data generator<br/>orders, payments, shipments"]
-        PG[("PostgreSQL 16<br/>shop schema<br/>wal_level=logical")]
+    subgraph SRC["Origen (Docker)"]
+        GEN["Generador de datos<br/>pedidos, pagos, envíos"]
+        PG[("PostgreSQL 16<br/>esquema shop<br/>wal_level=logical")]
         GEN -->|"inserts / updates / deletes"| PG
     end
 
     subgraph STREAM["Streaming (Docker)"]
         DBZ["Kafka Connect<br/>+ Debezium PostgreSQL"]
-        KAFKA[["Kafka (KRaft)<br/>one topic per table"]]
+        KAFKA[["Kafka (KRaft)<br/>un tópico por tabla"]]
         SPARK["Spark Structured Streaming"]
-        PG -->|"pgoutput<br/>logical replication"| DBZ
+        PG -->|"pgoutput<br/>replicación lógica"| DBZ
         DBZ --> KAFKA
         KAFKA --> SPARK
     end
 
     subgraph AWS["AWS (Terraform)"]
-        subgraph S3["S3 lake bucket (Delta Lake)"]
-            BRONZE[("bronze<br/>raw CDC events,<br/>append-only")]
-            SILVER[("silver<br/>current state + history,<br/>PII masked")]
-            GOLD[("gold<br/>business tables")]
+        subgraph S3["Bucket S3 del lake (Delta Lake)"]
+            BRONZE[("bronze<br/>eventos CDC crudos,<br/>solo agregado")]
+            SILVER[("silver<br/>estado actual + historial,<br/>PII enmascarada")]
+            GOLD[("gold<br/>tablas de negocio")]
         end
         GLUE["Glue Data Catalog"]
-        ATHENA["Athena<br/>workgroup with scan limit"]
-        GOLD -.->|registered in| GLUE
+        ATHENA["Athena<br/>workgroup con límite de escaneo"]
+        GOLD -.->|registrado en| GLUE
         GLUE --> ATHENA
     end
 
-    subgraph ORCH["Orchestration (Docker)"]
-        AIRFLOW["Airflow<br/>gold builds, quality checks,<br/>OPTIMIZE / VACUUM"]
+    subgraph ORCH["Orquestación (Docker)"]
+        AIRFLOW["Airflow<br/>construcción de gold, controles de calidad,<br/>OPTIMIZE / VACUUM"]
     end
 
-    subgraph CONSUME["Consumption"]
-        AGENT["AI agent tools<br/>read-only, gold only"]
+    subgraph CONSUME["Consumo"]
+        AGENT["Herramientas del agente de IA<br/>solo lectura, solo gold"]
         BI["Dashboards / SQL"]
     end
 
     SPARK -->|"append"| BRONZE
-    SPARK -->|"MERGE per micro-batch"| SILVER
+    SPARK -->|"MERGE por micro-batch"| SILVER
     AIRFLOW -->|"Spark batch"| GOLD
     SILVER --> AIRFLOW
     ATHENA --> AGENT
     ATHENA --> BI
 ```
 
-### Data flow
+### Flujo de datos
 
-1. **Capture.** Debezium reads the PostgreSQL write-ahead log through a logical
-   replication slot and publishes one event per row change to Kafka
-   (`shopflow.shop.<table>`). Each event carries the row before and after the change.
-2. **Bronze.** A Spark streaming job appends every event as-is to Delta tables on S3,
-   partitioned by table and date. Bronze is the replayable audit log.
-3. **Silver.** A second streaming query `MERGE`s each micro-batch into clean tables:
-   current state for most entities, SCD Type 2 history for `products`, an
-   `order_status_history` table built from status transitions, and masked PII.
-   Late or duplicated events are resolved using the source LSN, so reprocessing is
-   idempotent.
-4. **Gold.** Airflow rebuilds business tables from silver on a schedule (sales by
-   country and category, payment failure rates, late shipments, order lead times,
-   customer lifetime value) and runs data quality checks before publishing them.
-5. **Serve.** Gold tables are registered in the Glue Data Catalog and queried with
-   Athena. The AI agent gets a small set of read-only tools on top of those tables.
+1. **Captura.** Debezium lee el write-ahead log de PostgreSQL a través de un slot de replicación
+   lógica y publica un evento por cada cambio de fila en Kafka
+   (`shopflow.shop.<table>`). Cada evento incluye la fila antes y después del cambio.
+2. **Bronze.** Un job de Spark streaming agrega cada evento tal cual a tablas Delta en S3,
+   particionadas por tabla y fecha. Bronze es el log de auditoría que se puede reprocesar.
+3. **Silver.** Una segunda consulta de streaming aplica `MERGE` de cada micro-batch sobre tablas limpias:
+   estado actual para la mayoría de las entidades, historial SCD Type 2 para `products`, una
+   tabla `order_status_history` construida a partir de los cambios de estado, y PII enmascarada.
+   Los eventos tardíos o duplicados se resuelven usando el LSN de origen, por lo que el reprocesamiento es
+   idempotente.
+4. **Gold.** Airflow reconstruye periódicamente tablas de negocio a partir de silver (ventas por
+   país y categoría, tasas de fallo de pagos, envíos demorados, tiempos de ciclo de pedidos,
+   valor de vida del cliente) y ejecuta controles de calidad de datos antes de publicarlas.
+5. **Consumo.** Las tablas gold se registran en el Glue Data Catalog y se consultan con
+   Athena. El agente de IA recibe un conjunto reducido de herramientas de solo lectura sobre esas tablas.
 
-### Where each piece runs
+### Dónde corre cada pieza
 
-| Component | Runs on | Why |
+| Componente | Corre en | Por qué |
 |---|---|---|
-| PostgreSQL, Kafka, Debezium, Spark, Airflow | Docker Compose on a single VM, with per-service memory limits and profiles | Keeps the always-on cost at zero; the same images run on ECS/EKS |
-| Delta tables (bronze, silver, gold) | Amazon S3 | Durable, cheap storage that any engine can read |
-| Catalog and SQL | AWS Glue Data Catalog + Amazon Athena | Serverless, pay per query, no cluster to keep running |
-| AI agent tools | Container on the VM, calling Athena | Narrow, read-only access to gold |
-| AWS infrastructure | Terraform | Reproducible, reviewable, destroyable with one command |
+| PostgreSQL, Kafka, Debezium, Spark, Airflow | Docker Compose en una sola VM, con límites de memoria y perfiles por servicio | Mantiene en cero el costo fijo; las mismas imágenes corren en ECS/EKS |
+| Tablas Delta (bronze, silver, gold) | Amazon S3 | Almacenamiento durable y económico que cualquier motor puede leer |
+| Catálogo y SQL | AWS Glue Data Catalog + Amazon Athena | Serverless, pago por consulta, sin clúster que mantener encendido |
+| Herramientas del agente de IA | Contenedor en la VM, que llama a Athena | Acceso acotado y de solo lectura a gold |
+| Infraestructura AWS | Terraform | Reproducible, revisable y destruible con un solo comando |
 
-## Design decisions
+## Decisiones de diseño
 
-| Decision | Alternative considered | Reasoning |
+| Decisión | Alternativa considerada | Razonamiento |
 |---|---|---|
-| Debezium + Kafka for CDC | AWS DMS | Debezium is open source, keeps before/after images and ordering per key, and runs anywhere. DMS is a good fit when the team wants a managed service and is already all-in on AWS. |
-| Self-managed Kafka in Docker | Amazon MSK | MSK starts at hundreds of USD per month. For production with real SLAs, MSK (or MSK Serverless) is what I would recommend. |
-| Airflow in Docker | Amazon MWAA | Same reasoning: MWAA has a fixed monthly cost. The DAGs are portable to MWAA unchanged. |
-| Delta Lake | Apache Iceberg | Delta has mature `MERGE` support in open-source Spark and Athena reads it natively. Iceberg would be the choice if the client is standardising on it. |
-| Athena over gold only | Querying silver directly | Gold tables are small, documented and free of PII, which keeps both query cost and agent risk low. |
-| Agent tools instead of free-form SQL | Letting the LLM write SQL | Predictable cost and behaviour; every tool maps to a question the business actually asks. |
-| `REPLICA IDENTITY FULL` on source tables | Default (primary key only) | Full before-images make status transitions and price history trivial to derive, at the cost of more WAL. |
+| Debezium + Kafka para CDC | AWS DMS | Debezium es open source, conserva las imágenes before/after y el orden por clave, y corre en cualquier lugar. DMS es una buena opción cuando el equipo quiere un servicio administrado y ya está completamente en AWS. |
+| Kafka autoadministrado en Docker | Amazon MSK | MSK arranca en cientos de USD por mes. Para producción con SLAs reales, MSK (o MSK Serverless) es lo que recomendaría. |
+| Airflow en Docker | Amazon MWAA | El mismo razonamiento: MWAA tiene un costo mensual fijo. Los DAGs se pueden llevar a MWAA sin cambios. |
+| Delta Lake | Apache Iceberg | Delta tiene soporte maduro de `MERGE` en Spark open source y Athena lo lee de forma nativa. Iceberg sería la opción si el cliente está estandarizando sobre él. |
+| Athena solo sobre gold | Consultar silver directamente | Las tablas gold son pequeñas, están documentadas y no contienen PII, lo que mantiene bajos tanto el costo de las consultas como el riesgo del agente. |
+| Herramientas del agente en lugar de SQL libre | Dejar que el LLM escriba SQL | Costo y comportamiento predecibles; cada herramienta corresponde a una pregunta que el negocio realmente hace. |
+| `REPLICA IDENTITY FULL` en las tablas de origen | Valor por defecto (solo clave primaria) | Las imágenes "before" completas hacen trivial derivar los cambios de estado y el historial de precios, a costa de más WAL. |
 
-## Security
+## Seguridad
 
-- **No long-lived AWS keys for humans** (`aws login` sessions with MFA). The pipeline identity can only
-  touch the lake prefixes, and only from the VM's public IP (`aws:SourceIp`, set in a git-ignored
-  `terraform.tfvars`): a leaked key is useless anywhere else.
-- **S3:** encryption at rest, public access blocked, TLS enforced, Athena scans capped at 1 GB per query.
-- **Containers:** every port bound to `127.0.0.1`; Spark, generator and Airflow run as non-root on a
-  read-only filesystem with no capabilities; `no-new-privileges` everywhere. Airflow runs Spark
-  in-process instead of getting the Docker socket (which would be root on the host).
-- **Databases:** one role per purpose (Debezium: replication + read; generator: DML only; Airflow: its own
-  database), `CONNECT` revoked from `PUBLIC`.
-- **Secrets** live in untracked files (`docker/.env`, `docker/secrets/`), never in the repository or in
-  Terraform state. The Airflow UI password comes from a mounted file, so it is never printed to logs.
-  Kafka Connect's env config provider is allow-listed to the one variable it needs.
-- **PII** (`email`, `full_name`) is pseudonymised in silver; gold contains no PII.
-- Reviewed with an independent security pass before publishing; the findings and fixes are in the
-  commit history.
+- **Sin claves de AWS de larga duración para personas** (sesiones `aws login` con MFA). La identidad del pipeline solo puede
+  acceder a los prefijos del lake, y únicamente desde la IP pública de la VM (`aws:SourceIp`, definida en un
+  `terraform.tfvars` ignorado por git): una clave filtrada no sirve en ningún otro lugar.
+- **S3:** cifrado en reposo, acceso público bloqueado, TLS obligatorio, escaneos de Athena limitados a 1 GB por consulta.
+- **Contenedores:** todos los puertos ligados a `127.0.0.1`; Spark, el generador y Airflow corren como usuario no root sobre un
+  sistema de archivos de solo lectura y sin capabilities; `no-new-privileges` en todos. Airflow ejecuta Spark
+  en el mismo proceso en lugar de recibir el socket de Docker (que equivaldría a root en el host).
+- **Bases de datos:** un rol por propósito (Debezium: replicación + lectura; generador: solo DML; Airflow: su propia
+  base de datos), `CONNECT` revocado a `PUBLIC`.
+- **Los secretos** viven en archivos no versionados (`docker/.env`, `docker/secrets/`), nunca en el repositorio ni en el
+  state de Terraform. La contraseña de la UI de Airflow proviene de un archivo montado, por lo que nunca se imprime en los logs.
+  El proveedor de configuración por variables de entorno de Kafka Connect está restringido a la única variable que necesita.
+- **Los datos personales (PII)** (`email`, `full_name`) se seudonimizan en silver; gold no contiene PII.
+- Revisado con una auditoría de seguridad independiente antes de publicar; los hallazgos y las correcciones están en el
+  historial de commits.
 
-## Cost
+## Costo
 
-Target: **under USD 5 per month** on AWS for the demo (S3 storage, Athena scans,
-Glue catalog), with an AWS Budget alarm in place. The compute runs on an existing VM.
+Objetivo: **menos de USD 5 por mes** en AWS para la demo (almacenamiento en S3, escaneos de Athena,
+catálogo de Glue), con una alarma de AWS Budget configurada. El cómputo corre en una VM existente.
 
-## Quickstart
+## Inicio rápido
 
-Requirements: Docker with Compose v2, about 3 GB of free RAM.
+Requisitos: Docker con Compose v2, unos 3 GB de RAM libre.
 
 ```bash
 cp docker/.env.example docker/.env      # then fill in two random passwords
@@ -141,7 +143,7 @@ docker compose -f docker/compose.yaml up -d
 ./scripts/register-connector.sh         # registers the Debezium connector
 ```
 
-Make a change in the source database and watch it arrive in Kafka:
+Haz un cambio en la base de datos de origen y observa cómo llega a Kafka:
 
 ```bash
 docker compose -f docker/compose.yaml exec postgres \
@@ -151,120 +153,120 @@ docker compose -f docker/compose.yaml exec kafka /opt/kafka/bin/kafka-console-co
   --bootstrap-server localhost:9092 --topic shopflow.shop.orders --from-beginning
 ```
 
-Start the live data generator (customers ordering, paying with failures and retries, shipping,
-price changes, cart edits that produce deletes):
+Inicia el generador de datos en vivo (clientes que hacen pedidos, pagos con fallos y reintentos, envíos,
+cambios de precio, ediciones del carrito que producen deletes):
 
 ```bash
 docker compose -f docker/compose.yaml --profile generator up -d generator
 docker compose -f docker/compose.yaml logs -f generator     # progress every 60 s
 ```
 
-Time is compressed (one simulated hour = 60 s by default). Tune it with `GENERATOR_RATE` (actions per
-second, default 1) and `GENERATOR_TIME_SCALE` in `docker/.env`. The generator connects with its own
-role that can only read and write rows in the `shop` schema.
+El tiempo está comprimido (una hora simulada = 60 s por defecto). Se ajusta con `GENERATOR_RATE` (acciones por
+segundo, 1 por defecto) y `GENERATOR_TIME_SCALE` en `docker/.env`. El generador se conecta con su propio
+rol, que solo puede leer y escribir filas en el esquema `shop`.
 
-Optional web UI for topics and connectors: `docker compose -f docker/compose.yaml --profile ui up -d`,
-then open <http://localhost:8090>.
+UI web opcional para tópicos y conectores: `docker compose -f docker/compose.yaml --profile ui up -d`,
+y luego abrir <http://localhost:8090>.
 
-Each event carries the row `before` and `after` the change, the operation (`c`, `u`, `d`, or `r` for
-snapshot reads) and the source LSN, which the silver layer uses to apply changes exactly once.
+Cada evento incluye la fila `before` y `after` del cambio, la operación (`c`, `u`, `d`, o `r` para
+lecturas de snapshot) y el LSN de origen, que la capa silver usa para aplicar los cambios exactly-once.
 
-| Service | Image | Memory limit |
+| Servicio | Imagen | Límite de memoria |
 |---|---|---|
-| PostgreSQL (source) | `postgres:16-bookworm` | 512 MB |
-| Kafka (KRaft, single node) | `apache/kafka:4.3.1` | 1 GB |
+| PostgreSQL (origen) | `postgres:16-bookworm` | 512 MB |
+| Kafka (KRaft, un solo nodo) | `apache/kafka:4.3.1` | 1 GB |
 | Kafka Connect + Debezium | `quay.io/debezium/connect:3.6.2.Final` | 1 GB |
-| Data generator (optional) | built from `generator/` | 128 MB |
-| Spark bronze job (optional) | built from `spark/` | 2 GB |
-| Spark silver job (optional) | same image | 2 GB |
-| Airflow (optional) | built from `airflow/` on the Spark image | 3 GB |
-| Agent MCP server (on demand) | built from `agent/` | 256 MB |
-| kafka-ui (optional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
+| Generador de datos (opcional) | construida desde `generator/` | 128 MB |
+| Job bronze de Spark (opcional) | construida desde `spark/` | 2 GB |
+| Job silver de Spark (opcional) | la misma imagen | 2 GB |
+| Airflow (opcional) | construida desde `airflow/` sobre la imagen de Spark | 3 GB |
+| Servidor MCP del agente (a demanda) | construida desde `agent/` | 256 MB |
+| kafka-ui (opcional) | `kafbat/kafka-ui:v1.5.0` | 512 MB |
 
-Debezium connects with a dedicated role that only has `REPLICATION` and read access to the
-`shop` schema, and its password reaches the connector through Kafka's `EnvVarConfigProvider`,
-so it never appears in the connector config or the REST API.
+Debezium se conecta con un rol dedicado que solo tiene `REPLICATION` y acceso de lectura al
+esquema `shop`, y su contraseña llega al conector a través del `EnvVarConfigProvider` de Kafka,
+por lo que nunca aparece en la configuración del conector ni en la API REST.
 
-## Bronze layer (Spark Structured Streaming)
+## Capa bronze (Spark Structured Streaming)
 
-`spark/jobs/bronze_cdc.py` subscribes to every `shopflow.shop.*` topic and appends each Debezium event,
-untouched, to a single Delta table at `s3://<lake-bucket>/bronze/cdc_events`, partitioned by
-`event_date` and `source_table`.
+`spark/jobs/bronze_cdc.py` se suscribe a todos los tópicos `shopflow.shop.*` y agrega cada evento de Debezium,
+sin modificar, a una única tabla Delta en `s3://<lake-bucket>/bronze/cdc_events`, particionada por
+`event_date` y `source_table`.
 
 ```bash
 # needs docker/aws-pipeline.env with the pipeline IAM key and LAKE_BUCKET
 docker compose -f docker/compose.yaml --profile spark up -d spark-bronze
 ```
 
-| Column | Meaning |
+| Columna | Significado |
 |---|---|
-| `source_table`, `op`, `source_lsn`, `source_ts_ms` | Lifted from the payload for cheap filtering and ordering |
-| `payload` | Raw Debezium JSON (`before`, `after`, `source`, `op`), parsed only in silver |
-| `kafka_topic`, `kafka_partition`, `kafka_offset`, `kafka_timestamp` | Lineage back to Kafka |
-| `ingested_at`, `event_date` | Load time and partition date |
+| `source_table`, `op`, `source_lsn`, `source_ts_ms` | Extraídas del payload para filtrar y ordenar a bajo costo |
+| `payload` | JSON crudo de Debezium (`before`, `after`, `source`, `op`), que solo se parsea en silver |
+| `kafka_topic`, `kafka_partition`, `kafka_offset`, `kafka_timestamp` | Linaje hacia Kafka |
+| `ingested_at`, `event_date` | Hora de carga y fecha de partición |
 
-Design notes:
+Notas de diseño:
 
-- **Raw payload as a string.** An upstream schema change can never break ingestion; bronze stays a
-  faithful, replayable log and parsing errors are handled in silver.
-- **Exactly-once.** The checkpoint on S3 ties Kafka offsets to Delta commits. Verified after a restart:
-  15,340 events, zero duplicate offsets, zero gaps across all six topics.
-- **Single writer per table.** Delta's default S3 log store is safe with one writer; multiple concurrent
-  writers to the same table would need a coordinated log store.
-- **Cost-aware trigger.** Each micro-batch issues S3 requests, so the default trigger is one minute and
-  the job is meant to run on demand in the demo. Small files are compacted later with `OPTIMIZE`.
-- **Image built for reproducibility.** Spark 4.2.0, Delta 4.4.1 and hadoop-aws 3.5.0 jars are resolved at
-  build time (no Maven access at runtime), skipping libraries Spark already ships and pinning Jackson to
-  Spark's version to avoid classpath conflicts. Runs as a non-root user on a read-only filesystem.
+- **Payload crudo como string.** Un cambio de esquema en el origen nunca puede romper la ingesta; bronze sigue siendo un
+  log fiel y reprocesable, y los errores de parseo se manejan en silver.
+- **Exactly-once.** El checkpoint en S3 vincula los offsets de Kafka con los commits de Delta. Verificado tras un reinicio:
+  15,340 eventos, cero offsets duplicados, cero huecos en los seis tópicos.
+- **Un solo escritor por tabla.** El log store por defecto de Delta en S3 es seguro con un escritor; varios escritores
+  concurrentes sobre la misma tabla requerirían un log store coordinado.
+- **Trigger pensado en el costo.** Cada micro-batch genera solicitudes a S3, por lo que el trigger por defecto es de un minuto y
+  el job está pensado para correr a demanda en la demo. Los archivos pequeños se compactan luego con `OPTIMIZE`.
+- **Imagen construida para ser reproducible.** Los jars de Spark 4.2.0, Delta 4.4.1 y hadoop-aws 3.5.0 se resuelven en
+  tiempo de build (sin acceso a Maven en ejecución), omitiendo las librerías que Spark ya incluye y fijando Jackson a
+  la versión de Spark para evitar conflictos de classpath. Corre como usuario no root sobre un sistema de archivos de solo lectura.
 
-## Silver layer
+## Capa silver
 
-`spark/jobs/silver_cdc.py` streams from the bronze Delta table and, for every micro-batch, parses each
-source table's events and applies them with Delta `MERGE`:
+`spark/jobs/silver_cdc.py` lee en streaming la tabla Delta de bronze y, en cada micro-batch, parsea los eventos de
+cada tabla de origen y los aplica con `MERGE` de Delta:
 
-| Table | Shape | How it is maintained |
+| Tabla | Forma | Cómo se mantiene |
 |---|---|---|
-| `customers`, `orders`, `order_items`, `payments`, `shipments` | Current state, one row per key | Latest event per key in the batch; applied only if its LSN is newer than the stored one. Deletes are soft (`_is_deleted`) |
-| `products_history` | SCD Type 2 (`valid_from`, `valid_to`, `is_current`) | Closes the current version and inserts the new ones in a single MERGE |
-| `order_status_history` | One row per status transition | Derived from Debezium `before`/`after` images; insert-only MERGE on `(order_id, lsn)` |
-| `_rejects` | Unparseable events or events without a key | Kept for inspection instead of failing the stream |
+| `customers`, `orders`, `order_items`, `payments`, `shipments` | Estado actual, una fila por clave | Último evento por clave en el batch; se aplica solo si su LSN es más nuevo que el almacenado. Los deletes son lógicos (`_is_deleted`) |
+| `products_history` | SCD Type 2 (`valid_from`, `valid_to`, `is_current`) | Cierra la versión actual e inserta las nuevas en un solo MERGE |
+| `order_status_history` | Una fila por cambio de estado | Derivada de las imágenes `before`/`after` de Debezium; MERGE de solo inserción sobre `(order_id, lsn)` |
+| `_rejects` | Eventos que no se pueden parsear o sin clave | Se conservan para inspección en lugar de hacer fallar el stream |
 
 ```bash
 docker compose -f docker/compose.yaml --profile spark up -d spark-bronze spark-silver
 ```
 
-Design notes:
+Notas de diseño:
 
-- **Idempotent by construction.** Every write is either guarded by the source LSN or keyed on it
-  (rejects on `(topic, partition, offset)`), and duplicates from Kafka Connect's at-least-once delivery
-  are dropped before the history MERGEs. Re-running a micro-batch, or the whole history, changes nothing.
-- **Order-independent history.** SCD2 versions are inserted by `(product_id, lsn)` and `valid_to` /
-  `is_current` are recomputed for every touched product in the same MERGE, so replays that read bronze
-  files in a different order (e.g. after `OPTIMIZE`) still produce the same history. Time columns use the
-  commit timestamp, consistent with LSN order.
-- **Poison pills go to `_rejects`, not down the stream.** Values that cannot be cast (`try_cast`) or
-  payloads that are not JSON are kept with a `reason`. Delta concurrency conflicts (e.g. with `OPTIMIZE`)
-  are retried, which is safe because every write is idempotent.
-- **Soft deletes.** Keeping a tombstone row with its LSN stops a late or replayed event from
-  resurrecting a deleted row.
-- **PII never reaches silver in clear text.** `email` becomes a salted SHA-256 hash plus its domain, and
-  `full_name` is dropped. This is pseudonymisation, not anonymisation: the salt is a secret outside the
-  repository, and whoever holds it could test candidate emails.
-- **Least privilege shaped the code.** `DeltaTable.isDeltaTable()` walks up to the bucket root looking for
-  a `_delta_log`, which the pipeline identity cannot read; the job checks `<table>/_delta_log` directly.
+- **Idempotente por construcción.** Cada escritura está protegida por el LSN de origen o usa el LSN como clave
+  (los rechazos, sobre `(topic, partition, offset)`), y los duplicados de la entrega at-least-once de Kafka Connect
+  se descartan antes de los MERGE de historial. Volver a ejecutar un micro-batch, o todo el historial, no cambia nada.
+- **Historial independiente del orden.** Las versiones SCD2 se insertan por `(product_id, lsn)` y `valid_to` /
+  `is_current` se recalculan para cada producto afectado en el mismo MERGE, de modo que los reprocesamientos que leen archivos de bronze
+  en otro orden (por ejemplo, después de `OPTIMIZE`) producen el mismo historial. Las columnas de tiempo usan el
+  timestamp del commit, coherente con el orden del LSN.
+- **Los mensajes envenenados (poison pills) van a `_rejects`, no río abajo.** Los valores que no se pueden convertir (`try_cast`) o
+  los payloads que no son JSON se conservan con un `reason`. Los conflictos de concurrencia de Delta (por ejemplo, con `OPTIMIZE`)
+  se reintentan, lo cual es seguro porque cada escritura es idempotente.
+- **Deletes lógicos.** Conservar una fila marcada como eliminada (tombstone) con su LSN impide que un evento tardío o reprocesado
+  reviva una fila eliminada.
+- **La PII nunca llega a silver en texto plano.** `email` se convierte en un hash SHA-256 con salt más su dominio, y
+  `full_name` se descarta. Esto es seudonimización, no anonimización: el salt es un secreto fuera del
+  repositorio, y quien lo tenga podría probar emails candidatos.
+- **El mínimo privilegio moldeó el código.** `DeltaTable.isDeltaTable()` sube hasta la raíz del bucket buscando
+  un `_delta_log`, que la identidad del pipeline no puede leer; el job verifica `<table>/_delta_log` directamente.
 
-**Reconciliation with the source.** After about 3 hours of live traffic (~200,000 change events, ~9,900
-orders), 15 metrics (counts and amounts of orders by status, order lines, payments by status, shipments by
-status, customers, active products and their prices) were **identical** in PostgreSQL and silver, with
-exactly one current version per product, contiguous `valid_from`/`valid_to` chains and no duplicate status
-transitions. The silver checkpoint was then deleted to force a full replay: every MERGE reported 0 rows
-inserted, updated or deleted. Two deliberately malformed events injected into Kafka ended up in `_rejects`
-with their reason, and the stream kept running.
+**Conciliación con el origen.** Tras unas 3 horas de tráfico en vivo (~200,000 eventos de cambio, ~9,900
+pedidos), 15 métricas (cantidades e importes de pedidos por estado, líneas de pedido, pagos por estado, envíos por
+estado, clientes, productos activos y sus precios) resultaron **idénticas** en PostgreSQL y en silver, con
+exactamente una versión actual por producto, cadenas `valid_from`/`valid_to` contiguas y sin cambios de estado
+duplicados. Luego se borró el checkpoint de silver para forzar un reprocesamiento completo: cada MERGE reportó 0 filas
+insertadas, actualizadas o eliminadas. Dos eventos malformados inyectados a propósito en Kafka terminaron en `_rejects`
+con su motivo, y el stream siguió corriendo.
 
-## Gold layer (write-audit-publish)
+## Capa gold (write-audit-publish)
 
-`spark/jobs/gold_build.py` rebuilds six small business tables from silver, one per question the business
-asks. Nothing reaches consumers without passing the audit:
+`spark/jobs/gold_build.py` reconstruye seis tablas de negocio pequeñas a partir de silver, una por cada pregunta que hace
+el negocio. Nada llega a los consumidores sin pasar la auditoría:
 
 ```bash
 python jobs/gold_build.py build     # write every table to gold/_staging/
@@ -272,24 +274,24 @@ python jobs/gold_build.py audit     # 25 checks; exits non-zero on any failure
 python jobs/gold_build.py publish   # replace each published table in one Delta commit
 ```
 
-| Table | Answers |
+| Tabla | Responde |
 |---|---|
-| `daily_sales` | Orders, units and revenue by day, country and category |
-| `payment_provider_daily`, `payment_failure_reasons` | Payment failure rate by provider, and why payments fail |
-| `late_shipments` | Parcels delivered late or still open past the promised date |
-| `order_lead_times` | Hours to pay, to ship, in transit and end to end, per order |
-| `customer_ltv` | Orders, revenue and average order value per customer (no PII) |
+| `daily_sales` | Pedidos, unidades e ingresos por día, país y categoría |
+| `payment_provider_daily`, `payment_failure_reasons` | Tasa de fallo de pagos por proveedor, y por qué fallan los pagos |
+| `late_shipments` | Paquetes entregados tarde o todavía abiertos después de la fecha prometida |
+| `order_lead_times` | Horas hasta el pago, hasta el despacho, en tránsito y de punta a punta, por pedido |
+| `customer_ltv` | Pedidos, ingresos y ticket promedio por cliente (sin PII) |
 
-The audit checks non-empty tables, non-null and unique keys, business rules (failure rates in [0, 1],
-no negative durations, late parcels really late) and **reconciles revenue three ways** (silver order
-lines, `daily_sales`, `customer_ltv`). On its first run it blocked publication twice for real reasons: a
-source order whose header total did not match its lines (revenue is now always defined from lines, and
-such drift is reported), and late parcels whose rounded delay displayed as zero.
+La auditoría verifica tablas no vacías, claves no nulas y únicas, reglas de negocio (tasas de fallo en [0, 1],
+sin duraciones negativas, paquetes demorados realmente demorados) y **concilia los ingresos de tres formas** (líneas de
+pedido de silver, `daily_sales`, `customer_ltv`). En su primera ejecución bloqueó la publicación dos veces por motivos reales: un
+pedido de origen cuyo total de cabecera no coincidía con sus líneas (los ingresos ahora se definen siempre a partir de las líneas, y
+esa diferencia se reporta), y paquetes demorados cuyo retraso redondeado se mostraba como cero.
 
-**Querying with Athena.** Terraform creates the `shopflow_gold` Glue database and a `cdc-lakehouse`
-Athena workgroup (engine v3, results encrypted and expired after 7 days, 1 GB scan limit per query).
-`scripts/register-gold-tables.sh` registers the tables as native Delta tables, so Athena takes the schema
-from the transaction log instead of a hand-maintained column list.
+**Consultas con Athena.** Terraform crea la base de datos de Glue `shopflow_gold` y un workgroup de Athena
+`cdc-lakehouse` (motor v3, resultados cifrados y expirados a los 7 días, límite de escaneo de 1 GB por consulta).
+`scripts/register-gold-tables.sh` registra las tablas como tablas Delta nativas, de modo que Athena toma el esquema
+del log de transacciones en lugar de una lista de columnas mantenida a mano.
 
 ```sql
 SELECT provider, sum(failed) * 1.0 / sum(attempts) AS failure_rate
@@ -297,17 +299,17 @@ FROM shopflow_gold.payment_provider_daily
 GROUP BY provider ORDER BY failure_rate DESC;
 ```
 
-## Orchestration (Airflow)
+## Orquestación (Airflow)
 
-Airflow 3.3.2 runs as a single container built **on top of the Spark image**, so tasks run the Spark jobs
-in-process and Airflow never gets the Docker socket. `airflow standalone` (scheduler, API server, DAG
-processor, triggerer) with the `LocalExecutor` and its metadata in its own PostgreSQL database: a
-single-node setup sized for the demo VM, with `parallelism=1` so two Spark JVMs never compete for memory.
+Airflow 3.3.2 corre como un solo contenedor construido **sobre la imagen de Spark**, por lo que las tareas ejecutan los jobs de Spark
+en el mismo proceso y Airflow nunca recibe el socket de Docker. `airflow standalone` (scheduler, API server, DAG
+processor, triggerer) con el `LocalExecutor` y sus metadatos en su propia base de datos PostgreSQL: una
+configuración de un solo nodo dimensionada para la VM de la demo, con `parallelism=1` para que dos JVM de Spark nunca compitan por memoria.
 
-| DAG | Schedule | Tasks |
+| DAG | Programación | Tareas |
 |---|---|---|
-| `gold_pipeline` | every 15 min | `build` -> `audit` -> `publish` (audit never retried: a data problem does not fix itself) |
-| `lake_maintenance` | daily 06:30 UTC | `OPTIMIZE` + `VACUUM` (168 h) on bronze, silver and gold |
+| `gold_pipeline` | cada 15 min | `build` -> `audit` -> `publish` (la auditoría nunca se reintenta: un problema de datos no se arregla solo) |
+| `lake_maintenance` | diario 06:30 UTC | `OPTIMIZE` + `VACUUM` (168 h) sobre bronze, silver y gold |
 
 ```bash
 mkdir -m 700 docker/secrets
@@ -317,61 +319,61 @@ docker compose -f docker/compose.yaml --profile spark build spark-bronze   # Air
 docker compose -f docker/compose.yaml --profile airflow up -d airflow       # UI on http://localhost:8085
 ```
 
-`build` pins the silver table versions in a manifest and `audit` time-travels to those same versions, so
-the checks compare like with like even while silver keeps streaming. Verified by letting silver commit new
-versions between `build` and `audit`: the audit used the pinned versions and passed 25/25.
+`build` fija las versiones de las tablas silver en un manifiesto y `audit` usa time travel hacia esas mismas versiones, de modo que
+los controles comparan datos equivalentes aunque silver siga recibiendo streaming. Verificado dejando que silver hiciera commit de nuevas
+versiones entre `build` y `audit`: la auditoría usó las versiones fijadas y pasó 25/25.
 
-## AI agent tools (MCP)
+## Herramientas del agente de IA (MCP)
 
-`agent/` is an [MCP](https://modelcontextprotocol.io) server that lets any MCP client (Claude Code, Claude
-Desktop, an agent framework) answer business questions from the gold layer. The agent never writes SQL:
-it gets eight fixed, read-only tools, one per business question, designed in
+`agent/` es un servidor [MCP](https://modelcontextprotocol.io) que permite a cualquier cliente MCP (Claude Code, Claude
+Desktop, un framework de agentes) responder preguntas de negocio a partir de la capa gold. El agente nunca escribe SQL:
+recibe ocho herramientas fijas y de solo lectura, una por pregunta de negocio, diseñadas en
 [docs/agent-tools.md](docs/agent-tools.md).
 
-| Tool | Question |
+| Herramienta | Pregunta |
 |---|---|
-| `get_sales_summary` | How much did we sell, by day, country and category? |
-| `get_payment_failure_rate`, `get_payment_failure_reasons` | Which share of payments fail, with which provider, and why? |
-| `get_late_shipments`, `get_late_shipments_by_carrier` | Which parcels are overdue, and which carriers are behind? |
-| `get_order_lead_times` | How long does an order take to pay, ship and deliver (avg, p50, p90)? |
-| `get_top_customers_ltv` | Who are the most valuable customers (by id only)? |
-| `data_freshness` | How current is the data? |
+| `get_sales_summary` | ¿Cuánto vendimos, por día, país y categoría? |
+| `get_payment_failure_rate`, `get_payment_failure_reasons` | ¿Qué proporción de pagos falla, con qué proveedor y por qué? |
+| `get_late_shipments`, `get_late_shipments_by_carrier` | ¿Qué paquetes están vencidos y qué transportistas están atrasados? |
+| `get_order_lead_times` | ¿Cuánto tarda un pedido en pagarse, despacharse y entregarse (promedio, p50, p90)? |
+| `get_top_customers_ltv` | ¿Quiénes son los clientes más valiosos (solo por id)? |
+| `data_freshness` | ¿Qué tan actualizados están los datos? |
 
 ```bash
 docker compose -f docker/compose.yaml --profile agent build agent
 claude   # from the repo root: .mcp.json registers the server, then just ask a question
 ```
 
-Guardrails, all enforced in code and tested offline (`python -m unittest test_tools`):
+Guardrails (límites), todos aplicados en código y probados sin conexión (`python -m unittest test_tools`):
 
-- **No free-form SQL.** Arguments are validated against closed lists and ranges (countries, providers,
-  carriers, dates up to 92 days, at most 50 rows) before any query runs, and values reach Athena as
-  `ExecutionParameters`, never by string concatenation. Invalid arguments are rejected by the MCP schema.
-- **Least privilege, enforced by IAM, not by the prompt.** The `cdc-lakehouse-agent` identity can only run
-  Athena queries in the `cdc-lakehouse` workgroup (1 GB scan cap) from the VM's IP. Glue and S3 access is
-  granted only when Athena makes the call on its behalf (`aws:CalledVia`), so the key cannot download lake
-  files, and staging, silver and bronze are explicitly denied. Verified: queries on gold succeed; direct
-  S3, direct Glue, other workgroups and IAM calls are denied.
-- **No PII.** Customers are returned by `customer_id` only; the customer tool's column list never includes
-  emails or email domains.
-- **Honest answers.** Every result carries notes on units (USD, fractions, compressed simulation clock),
-  known gaps (late parcels have no on-time denominator) and freshness, and empty results are flagged as
-  "no data", not zero.
+- **Sin SQL libre.** Los argumentos se validan contra listas cerradas y rangos (países, proveedores,
+  transportistas, fechas de hasta 92 días, como máximo 50 filas) antes de ejecutar cualquier consulta, y los valores llegan a Athena como
+  `ExecutionParameters`, nunca por concatenación de strings. Los argumentos inválidos son rechazados por el esquema MCP.
+- **Mínimo privilegio, aplicado por IAM y no por el prompt.** La identidad `cdc-lakehouse-agent` solo puede ejecutar
+  consultas de Athena en el workgroup `cdc-lakehouse` (límite de escaneo de 1 GB) desde la IP de la VM. El acceso a Glue y S3 se
+  otorga solo cuando Athena hace la llamada en su nombre (`aws:CalledVia`), por lo que la clave no puede descargar archivos
+  del lake, y staging, silver y bronze están denegados explícitamente. Verificado: las consultas sobre gold funcionan; el acceso directo
+  a S3, el acceso directo a Glue, otros workgroups y las llamadas a IAM son denegados.
+- **Sin PII.** Los clientes se devuelven solo por `customer_id`; la lista de columnas de la herramienta de clientes nunca incluye
+  emails ni dominios de email.
+- **Respuestas honestas.** Cada resultado incluye notas sobre unidades (USD, fracciones, reloj de simulación comprimido),
+  limitaciones conocidas (los paquetes demorados no tienen un denominador de entregas a tiempo) y frescura de los datos, y los resultados vacíos se marcan como
+  "sin datos", no como cero.
 
-Example, asked to Claude Code with only these tools enabled: *"Which carriers have the most parcels
-currently overdue in Argentina, and how fresh is the data?"*. The agent called the tools, ranked OCA and
-Andreani first, pointed out that this ranks by volume rather than rate, converted the compressed clock to
-simulated hours and stated that the data was as of the last gold build. It also noticed that carriers from
-other countries were delivering in Argentina, a quirk of the data generator now tracked in the roadmap.
+Ejemplo, consultado a Claude Code con solo estas herramientas habilitadas: *"¿Qué transportistas tienen más paquetes
+vencidos actualmente en Argentina, y qué tan actualizados están los datos?"*. El agente llamó a las herramientas, ubicó primero a OCA y
+Andreani, señaló que el ranking es por volumen y no por tasa, convirtió el reloj comprimido a
+horas simuladas e indicó que los datos correspondían a la última construcción de gold. También notó que transportistas de
+otros países estaban entregando en Argentina, una peculiaridad del generador de datos que ahora figura en el roadmap.
 
-## AWS infrastructure (Terraform)
+## Infraestructura AWS (Terraform)
 
-Two stacks under `terraform/`:
+Dos stacks dentro de `terraform/`:
 
-| Stack | Creates | State |
+| Stack | Crea | State |
 |---|---|---|
-| `bootstrap/` | S3 bucket for Terraform state (versioned, encrypted, TLS-only, `prevent_destroy`) | Local (copied to the state bucket as a backup) |
-| `lake/` | Lake bucket (`bronze/`, `silver/`, `gold/`, `_checkpoints/`), lifecycle rules, pipeline IAM identity | S3 backend with native lockfile (no DynamoDB) |
+| `bootstrap/` | Bucket S3 para el state de Terraform (versionado, cifrado, solo TLS, `prevent_destroy`) | Local (copiado al bucket de state como respaldo) |
+| `lake/` | Bucket del lake (`bronze/`, `silver/`, `gold/`, `_checkpoints/`), reglas de ciclo de vida, identidad IAM del pipeline | Backend S3 con lockfile nativo (sin DynamoDB) |
 
 ```bash
 cd terraform/bootstrap && terraform init && terraform apply
@@ -381,50 +383,50 @@ terraform init -backend-config=backend.hcl && terraform apply
 aws iam create-access-key --user-name cdc-lakehouse-pipeline   # store it outside git
 ```
 
-Choices worth calling out:
+Decisiones que vale la pena destacar:
 
-- **No access keys in Terraform.** The pipeline user is managed in code, but its key is created with the
-  CLI so the secret never lands in Terraform state.
-- **Least privilege, verified.** The pipeline identity can read, write and delete only under the lake
-  prefixes. Writing to the bucket root, reading Terraform state, listing other buckets, IAM calls and
-  plain-HTTP requests are all denied.
-- **SSE-S3 instead of a customer-managed KMS key**, which would add a fixed monthly cost per key.
-- **No S3 versioning on the lake.** Delta Lake keeps its own table history; versioning would retain every
-  file that `VACUUM` deletes.
-- **Account id never hardcoded.** Bucket names are derived at plan time and the backend bucket comes from a
-  git-ignored `backend.hcl`.
+- **Sin access keys en Terraform.** El usuario del pipeline se gestiona en código, pero su clave se crea con la
+  CLI para que el secreto nunca quede en el state de Terraform.
+- **Mínimo privilegio, verificado.** La identidad del pipeline puede leer, escribir y borrar solo dentro de los prefijos
+  del lake. Escribir en la raíz del bucket, leer el state de Terraform, listar otros buckets, las llamadas a IAM y
+  las solicitudes por HTTP sin cifrar están todas denegadas.
+- **SSE-S3 en lugar de una clave KMS administrada por el cliente**, que agregaría un costo mensual fijo por clave.
+- **Sin versionado de S3 en el lake.** Delta Lake mantiene su propio historial de tablas; el versionado retendría cada
+  archivo que `VACUUM` elimina.
+- **El id de la cuenta nunca está hardcodeado.** Los nombres de los buckets se derivan en tiempo de plan y el bucket del backend proviene de un
+  `backend.hcl` ignorado por git.
 
 ## Roadmap
 
-- [x] Source data model and schema
-- [x] Architecture
-- [x] Local stack: PostgreSQL, Kafka, Debezium (Docker Compose)
-- [x] Data generator with live changes
-- [x] AWS infrastructure in Terraform: S3 lake, remote state, least-privilege pipeline identity
-- [x] Glue Data Catalog and Athena workgroup (Terraform) with gold tables registered from the Delta log
-- [x] Bronze streaming job (Kafka -> Delta on S3, exactly-once verified)
-- [x] Silver streaming job (MERGE by LSN, SCD2, status history, PII masking), reconciled with the source
-- [x] Gold layer with write-audit-publish and 25 data quality checks
-- [x] Airflow orchestration (gold every 15 min, daily OPTIMIZE / VACUUM)
-- [x] Independent security and data-correctness review, findings fixed
-- [x] AI agent tools over gold (MCP server, read-only Athena identity)
-- [ ] Generator: carriers consistent with the customer's country
-- [ ] Gold: shipments_daily (on-time denominator for late rates) and build metadata for freshness
-- [ ] Demo video
+- [x] Modelo de datos y esquema de origen
+- [x] Arquitectura
+- [x] Stack local: PostgreSQL, Kafka, Debezium (Docker Compose)
+- [x] Generador de datos con cambios en vivo
+- [x] Infraestructura AWS en Terraform: lake en S3, state remoto, identidad del pipeline con mínimo privilegio
+- [x] Glue Data Catalog y workgroup de Athena (Terraform) con tablas gold registradas desde el log de Delta
+- [x] Job de streaming bronze (Kafka -> Delta en S3, exactly-once verificado)
+- [x] Job de streaming silver (MERGE por LSN, SCD2, historial de estados, enmascaramiento de PII), conciliado con el origen
+- [x] Capa gold con write-audit-publish y 25 controles de calidad de datos
+- [x] Orquestación con Airflow (gold cada 15 min, OPTIMIZE / VACUUM diario)
+- [x] Revisión independiente de seguridad y de corrección de datos, hallazgos corregidos
+- [x] Herramientas del agente de IA sobre gold (servidor MCP, identidad de Athena de solo lectura)
+- [ ] Generador: transportistas coherentes con el país del cliente
+- [ ] Gold: shipments_daily (denominador de entregas a tiempo para las tasas de demora) y metadatos de construcción para la frescura
+- [ ] Video de demostración
 
-## Repository layout
+## Estructura del repositorio
 
 ```
-docker/      Docker Compose stack and service configs
-generator/   Live data generator for the source database
-scripts/     Helper scripts
-terraform/   AWS infrastructure
-spark/       Streaming and batch jobs
+docker/      Stack de Docker Compose y configuración de los servicios
+generator/   Generador de datos en vivo para la base de origen
+scripts/     Scripts auxiliares
+terraform/   Infraestructura de AWS
+spark/       Jobs de streaming y batch
 airflow/     DAGs
-agent/       MCP server with read-only AI agent tools over gold
-docs/        Data model and design notes
+agent/       Servidor MCP con herramientas de solo lectura para el agente de IA sobre gold
+docs/        Modelo de datos y notas de diseño (versión en inglés en docs/en/)
 ```
 
-## License
+## Licencia
 
 [MIT](LICENSE)

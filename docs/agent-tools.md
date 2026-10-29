@@ -1,65 +1,67 @@
-# AI agent tools over the gold layer
+# Herramientas del agente de IA sobre la capa gold
 
-Implemented as an MCP server in [`agent/`](../agent) (`server.py`, `tools.py`, `athena.py`, offline tests in
-`test_tools.py`). Implementation notes that differ from the first design:
+> Nota: en el código, las descripciones de cada herramienta están en inglés porque las lee el modelo; aquí se presentan traducidas.
 
-- `LIMIT` values (`top_n`, `limit`) are validated integers spliced into the SQL instead of `?`
-  placeholders; every other value goes through `ExecutionParameters`.
-- `data_freshness` covers five tables (`payment_failure_reasons` is left out: it shares dates with
-  `payment_provider_daily`) and casts `NULL` explicitly.
-- The agent runs as a dedicated IAM user that can only call Athena in the `cdc-lakehouse` workgroup;
-  it reaches Glue and S3 exclusively through Athena (`aws:CalledVia`), and is denied `gold/_staging/`,
-  `silver/` and `bronze/`.
+Implementado como servidor MCP en [`agent/`](../agent) (`server.py`, `tools.py`, `athena.py`, tests offline en
+`test_tools.py`). Notas de implementación que difieren del primer diseño:
 
-The agent never writes SQL. It calls a fixed set of read-only tools; each tool maps to one business
-question and runs one parameterized Athena query against `shopflow_gold` (Athena engine v3, Trino SQL,
-workgroup `cdc-lakehouse`, 1 GB scan limit per query).
+- Los valores de `LIMIT` (`top_n`, `limit`) son enteros validados que se insertan en el SQL en lugar de
+  placeholders `?`; todos los demás valores pasan por `ExecutionParameters`.
+- `data_freshness` cubre cinco tablas (`payment_failure_reasons` queda afuera: comparte fechas con
+  `payment_provider_daily`) y castea `NULL` de forma explícita.
+- El agente se ejecuta como un usuario IAM dedicado que solo puede llamar a Athena en el workgroup `cdc-lakehouse`;
+  accede a Glue y S3 exclusivamente a través de Athena (`aws:CalledVia`), y tiene denegado `gold/_staging/`,
+  `silver/` y `bronze/`.
 
-## Conventions shared by all tools
+El agente nunca escribe SQL. Llama a un conjunto fijo de herramientas de solo lectura; cada herramienta corresponde a
+una pregunta de negocio y ejecuta una consulta parametrizada de Athena contra `shopflow_gold` (Athena engine v3, SQL
+de Trino, workgroup `cdc-lakehouse`, límite de escaneo de 1 GB por consulta).
 
-- **Execution.** `StartQueryExecution` with `QueryString` containing `?` placeholders and
-  `ExecutionParameters` (strings, in placeholder order). The wrapper sends string values as SQL
-  literals (`'AR'`, `'2026-10-01'`), integers as bare numbers. The `?` placeholders are never
-  concatenated. The only text substituted into SQL are fixed snippets chosen from an allow-list in the
-  wrapper (the `{dims}` / `{group_expr}` fragments below), never user input.
-- **Validation (before any query).** Dates must be ISO `YYYY-MM-DD`, `date_from <= date_to`, range
-  at most 92 days. Enumerated values are checked against closed lists:
+## Convenciones comunes a todas las herramientas
+
+- **Ejecución.** `StartQueryExecution` con un `QueryString` que contiene placeholders `?` y
+  `ExecutionParameters` (strings, en el orden de los placeholders). El wrapper envía los valores string como
+  literales SQL (`'AR'`, `'2026-10-01'`) y los enteros como números sin comillas. Los placeholders `?` nunca se
+  concatenan. El único texto que se sustituye en el SQL son fragmentos fijos elegidos de una allow-list en el
+  wrapper (los fragmentos `{dims}` / `{group_expr}` que se ven más abajo), nunca entrada del usuario.
+- **Validación (antes de cualquier consulta).** Las fechas deben estar en formato ISO `YYYY-MM-DD`,
+  `date_from <= date_to`, con un rango de 92 días como máximo. Los valores enumerados se verifican contra listas cerradas:
   - `country`: AR, MX, CL, CO, UY, PE
   - `category`: home, electronics, sports, books, beauty
   - `provider`: mercadopago, stripe, paypal
   - `carrier`: Andreani, OCA, Correo Argentino, Estafeta, Chilexpress, Servientrega
-  - `limit` / `top_n`: integer 1..50.
-  Anything else returns a validation error that lists the allowed values; no query is run.
-- **Optional filters.** An omitted filter is passed as the string `ALL`, and the SQL uses
-  `(? = 'ALL' OR col = ?)`, so the placeholder count is fixed. Each such filter therefore consumes two
-  parameters (same value twice).
-- **Defaults for dates.** When `date_from` / `date_to` are omitted the wrapper resolves them to the
-  current UTC date (`today`), so the SQL always receives explicit dates.
-- **Output.** Rows as JSON (`columns`, `rows`) plus `meta`: `table`, `rows_returned`, `data_as_of`
-  (see Guardrails), `currency` where relevant, and `notes` (strings the LLM must relay).
-- **Time scale warning.** The generator compresses time (1 simulated hour = 1 real minute). Every
-  `hours_*` value is in real hours and is small (minutes to a few hours); it must not be read as
-  production-realistic delivery times.
+  - `limit` / `top_n`: entero 1..50.
+  Cualquier otro valor devuelve un error de validación que lista los valores permitidos; no se ejecuta ninguna consulta.
+- **Filtros opcionales.** Un filtro omitido se pasa como el string `ALL`, y el SQL usa
+  `(? = 'ALL' OR col = ?)`, de modo que la cantidad de placeholders es fija. Por eso cada uno de estos filtros consume
+  dos parámetros (el mismo valor dos veces).
+- **Valores por defecto de fechas.** Cuando se omiten `date_from` / `date_to`, el wrapper los resuelve como la
+  fecha UTC actual (`today`), así el SQL siempre recibe fechas explícitas.
+- **Salida.** Filas en JSON (`columns`, `rows`) más `meta`: `table`, `rows_returned`, `data_as_of`
+  (ver Guardrails), `currency` cuando corresponde, y `notes` (strings que el LLM debe transmitir).
+- **Advertencia sobre la escala de tiempo.** El generador comprime el tiempo (1 hora simulada = 1 minuto real). Todo
+  valor `hours_*` está en horas reales y es pequeño (de minutos a unas pocas horas); no debe interpretarse como
+  tiempos de entrega realistas de producción.
 
 ---
 
 ## 1. `get_sales_summary`
 
-**Description for the LLM.** Revenue, units and order count for a date range, optionally broken down by
-day, country and/or category. Use it for "how much did we sell today / this week". It counts only
-orders currently in status paid, shipped or delivered (not pending or cancelled), by order creation
-date. It does not answer profit, margin, refunds or per-customer questions.
+**Descripción para el LLM.** Ingresos, unidades y cantidad de pedidos para un rango de fechas, con desglose opcional por
+día, país y/o categoría. Úsala para "¿cuánto vendimos hoy / esta semana?". Cuenta solo los
+pedidos que actualmente están en estado paid, shipped o delivered (no pending ni cancelled), según la fecha de creación
+del pedido. No responde preguntas sobre ganancia, margen, reembolsos ni por cliente.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
-| `date_from` | string (ISO date) | no | range <= 92 days | today (UTC) |
-| `date_to` | string (ISO date) | no | >= `date_from` | today (UTC) |
-| `country` | string | no | AR, MX, CL, CO, UY, PE | all |
-| `category` | string | no | home, electronics, sports, books, beauty | all |
+| `date_from` | string (fecha ISO) | no | rango <= 92 días | hoy (UTC) |
+| `date_to` | string (fecha ISO) | no | >= `date_from` | hoy (UTC) |
+| `country` | string | no | AR, MX, CL, CO, UY, PE | todos |
+| `category` | string | no | home, electronics, sports, books, beauty | todas |
 | `group_by` | enum | no | `none`, `day`, `country`, `category`, `country_category`, `day_country` | `country` |
 
-`{dims}` and `{group_expr}` come from a fixed map keyed by `group_by`
-(e.g. `country` -> dims `country`, `ORDER BY revenue DESC`; `none` -> `'all'` literal, no dimension).
+`{dims}` y `{group_expr}` provienen de un mapa fijo indexado por `group_by`
+(p. ej., `country` -> dims `country`, `ORDER BY revenue DESC`; `none` -> literal `'all'`, sin dimensión).
 
 ```sql
 SELECT {dims}
@@ -76,28 +78,28 @@ ORDER BY {order_expr}
 LIMIT 50
 ```
 
-Note: `sum(orders)` over a category breakdown double counts an order that contains several categories.
-The tool only reports the order total when `group_by` does not include `category`; otherwise it returns
-`orders_with_category` and the notes say orders are not additive across categories.
+Nota: `sum(orders)` sobre un desglose por categoría cuenta dos veces un pedido que contiene varias categorías.
+La herramienta solo informa el total de pedidos cuando `group_by` no incluye `category`; en caso contrario devuelve
+`orders_with_category` y las notas aclaran que los pedidos no son aditivos entre categorías.
 
-**Output columns.** `[order_date] [country] [category] orders, units, revenue_usd, avg_order_value_usd`.
-**Example.** "How much did we sell this week in Mexico, by category?"
+**Columnas de salida.** `[order_date] [country] [category] orders, units, revenue_usd, avg_order_value_usd`.
+**Ejemplo.** "¿Cuánto vendimos esta semana en México, por categoría?"
 -> `{date_from: monday, date_to: today, country: "MX", group_by: "category"}`.
 
 ---
 
 ## 2. `get_payment_failure_rate`
 
-**Description for the LLM.** Share of payment attempts that failed, by provider (optionally by day).
-Use it for "what percentage of payments fail". Counts attempts, so a retried payment counts as several
-attempts; it is not the share of orders that could not be paid. For the reason behind failures use
+**Descripción para el LLM.** Proporción de intentos de pago que fallaron, por proveedor (opcionalmente por día).
+Úsala para "¿qué porcentaje de los pagos falla?". Cuenta intentos, por lo que un pago reintentado cuenta como varios
+intentos; no es la proporción de pedidos que no se pudieron pagar. Para conocer el motivo de los fallos usa
 `get_payment_failure_reasons`.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
-| `date_from` | string (ISO date) | no | range <= 92 days | today - 6 days |
-| `date_to` | string (ISO date) | no | >= `date_from` | today (UTC) |
-| `provider` | string | no | mercadopago, stripe, paypal | all |
+| `date_from` | string (fecha ISO) | no | rango <= 92 días | hoy - 6 días |
+| `date_to` | string (fecha ISO) | no | >= `date_from` | hoy (UTC) |
+| `provider` | string | no | mercadopago, stripe, paypal | todos |
 | `group_by` | enum | no | `provider`, `day_provider` | `provider` |
 
 ```sql
@@ -115,29 +117,29 @@ ORDER BY {order_expr}
 LIMIT 50
 ```
 
-The rate is always recomputed as `sum(failed) / sum(attempts)`; averaging the daily `failure_rate`
-column would be wrong.
+La tasa siempre se recalcula como `sum(failed) / sum(attempts)`; promediar la columna diaria `failure_rate`
+sería incorrecto.
 
-**Output columns.** `[attempt_date] provider, attempts, failed, captured, failure_rate, captured_amount_usd`.
-**Example.** "Which payment provider fails the most this week?"
+**Columnas de salida.** `[attempt_date] provider, attempts, failed, captured, failure_rate, captured_amount_usd`.
+**Ejemplo.** "¿Qué proveedor de pagos falla más esta semana?"
 
 ---
 
 ## 3. `get_payment_failure_reasons`
 
-**Description for the LLM.** Why payments fail: failure count per `failure_code`, per provider, with the
-share of all failures and the share of all attempts. Use it after `get_payment_failure_rate`, or for
-"what is the main reason payments fail on Stripe". It does not give per-customer or per-order detail.
+**Descripción para el LLM.** Por qué fallan los pagos: cantidad de fallos por `failure_code` y por proveedor, con la
+proporción sobre el total de fallos y sobre el total de intentos. Úsala después de `get_payment_failure_rate`, o para
+"¿cuál es el principal motivo de fallo de los pagos en Stripe?". No da detalle por cliente ni por pedido.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
-| `date_from` | string (ISO date) | no | range <= 92 days | today - 6 days |
-| `date_to` | string (ISO date) | no | >= `date_from` | today (UTC) |
-| `provider` | string | no | mercadopago, stripe, paypal | all |
+| `date_from` | string (fecha ISO) | no | rango <= 92 días | hoy - 6 días |
+| `date_to` | string (fecha ISO) | no | >= `date_from` | hoy (UTC) |
+| `provider` | string | no | mercadopago, stripe, paypal | todos |
 | `top_n` | integer | no | 1..50 | 10 |
 
-`failure_code` is free text from the source (e.g. `insufficient_funds`, `card_declined`), so it is
-returned as data and not validated against a list.
+`failure_code` es texto libre del origen (p. ej., `insufficient_funds`, `card_declined`), por lo que se
+devuelve como dato y no se valida contra una lista.
 
 ```sql
 WITH reasons AS (
@@ -165,23 +167,23 @@ ORDER BY r.failures DESC
 LIMIT ?                                                                      -- top_n
 ```
 
-**Output columns.** `provider, failure_code, failures, share_of_provider_failures, share_of_provider_attempts`.
-**Example.** "What are the top reasons payments fail with MercadoPago?"
+**Columnas de salida.** `provider, failure_code, failures, share_of_provider_failures, share_of_provider_attempts`.
+**Ejemplo.** "¿Cuáles son los principales motivos por los que fallan los pagos con MercadoPago?"
 
 ---
 
 ## 4. `get_late_shipments`
 
-**Description for the LLM.** Shipments late against their promised date, as of the last gold build.
-`open_overdue` = not delivered yet and past `promised_at`; `delivered_late` = delivered after
-`promised_at`. Use it for "which orders are delayed now". It does not return on-time shipments, so it
-cannot give a "% late"; returned shipments are not included. No customer data is returned.
+**Descripción para el LLM.** Envíos atrasados respecto de su fecha prometida, según el último build de gold.
+`open_overdue` = todavía no entregado y con `promised_at` vencido; `delivered_late` = entregado después de
+`promised_at`. Úsala para "¿qué pedidos están demorados ahora?". No devuelve los envíos a tiempo, por lo que
+no puede dar un "% de atrasos"; los envíos devueltos no se incluyen. No se devuelven datos de clientes.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
 | `late_type` | enum | no | `open_overdue`, `delivered_late`, `all` | `open_overdue` |
-| `carrier` | string | no | Andreani, OCA, Correo Argentino, Estafeta, Chilexpress, Servientrega | all |
-| `country` | string | no | AR, MX, CL, CO, UY, PE | all |
+| `carrier` | string | no | Andreani, OCA, Correo Argentino, Estafeta, Chilexpress, Servientrega | todos |
+| `country` | string | no | AR, MX, CL, CO, UY, PE | todos |
 | `limit` | integer | no | 1..50 | 20 |
 
 ```sql
@@ -205,25 +207,25 @@ ORDER BY hours_late DESC
 LIMIT ?                                   -- limit
 ```
 
-Notes the tool adds: `hours_late` is measured at `snapshot_at`, not now, so open shipments keep
-growing until the next build; units are real hours under the compressed clock. `total_matching` lets
-the agent say "showing 20 of 134".
+Notas que agrega la herramienta: `hours_late` se mide en `snapshot_at`, no en el momento actual, por lo que los envíos
+abiertos siguen sumando atraso hasta el próximo build; las unidades son horas reales bajo el reloj comprimido.
+`total_matching` permite que el agente diga "mostrando 20 de 134".
 
-**Output columns.** `shipment_id, order_id, carrier, country, status, late_type, promised_at, shipped_at, delivered_at, hours_late, snapshot_at, total_matching`.
-**Example.** "Which orders are late right now and with which carrier?"
+**Columnas de salida.** `shipment_id, order_id, carrier, country, status, late_type, promised_at, shipped_at, delivered_at, hours_late, snapshot_at, total_matching`.
+**Ejemplo.** "¿Qué pedidos están atrasados ahora mismo y con qué transportista?"
 
 ---
 
 ## 5. `get_late_shipments_by_carrier`
 
-**Description for the LLM.** Count and average delay of late shipments grouped by carrier and country,
-for a quick "who is failing" view. Use `get_late_shipments` for the individual orders. Counts only late
-shipments (no denominator), so it ranks carriers by late volume, not by late rate.
+**Descripción para el LLM.** Cantidad y demora promedio de los envíos atrasados agrupados por transportista y país,
+para una vista rápida de "quién está fallando". Usa `get_late_shipments` para ver los pedidos individuales. Cuenta solo
+envíos atrasados (sin denominador), por lo que ordena a los transportistas por volumen de atrasos, no por tasa de atrasos.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
 | `late_type` | enum | no | `open_overdue`, `delivered_late`, `all` | `open_overdue` |
-| `country` | string | no | AR, MX, CL, CO, UY, PE | all |
+| `country` | string | no | AR, MX, CL, CO, UY, PE | todos |
 
 ```sql
 SELECT carrier,
@@ -240,24 +242,24 @@ ORDER BY late_shipments DESC
 LIMIT 50
 ```
 
-**Output columns.** `carrier, country, late_shipments, avg_hours_late, max_hours_late, snapshot_at`.
-**Example.** "Which carrier has the most delayed parcels in Argentina?"
+**Columnas de salida.** `carrier, country, late_shipments, avg_hours_late, max_hours_late, snapshot_at`.
+**Ejemplo.** "¿Qué transportista tiene más paquetes demorados en Argentina?"
 
 ---
 
 ## 6. `get_order_lead_times`
 
-**Description for the LLM.** How long orders take from `pending` to `delivered`, and per stage
-(pending to paid, paid to shipped, shipped to delivered): average, median and p90 in real hours, for
-orders created in a date range. Only orders that reached the stage are included (`orders_measured`).
-Hours are real hours under a compressed simulation clock (1 simulated hour = 1 real minute), so
-multiply by 60 to read them as simulated hours. Not suited to individual order tracking.
+**Descripción para el LLM.** Cuánto tardan los pedidos desde `pending` hasta `delivered`, y por etapa
+(de pending a paid, de paid a shipped, de shipped a delivered): promedio, mediana y p90 en horas reales, para
+pedidos creados en un rango de fechas. Solo se incluyen los pedidos que alcanzaron la etapa (`orders_measured`).
+Las horas son horas reales bajo un reloj de simulación comprimido (1 hora simulada = 1 minuto real), así que
+hay que multiplicarlas por 60 para leerlas como horas simuladas. No es adecuada para el seguimiento de pedidos individuales.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
-| `date_from` | string (ISO date) | no | range <= 92 days; applies to order creation date | today - 6 days |
-| `date_to` | string (ISO date) | no | >= `date_from` | today (UTC) |
-| `country` | string | no | AR, MX, CL, CO, UY, PE | all (one row per country if `group_by=country`) |
+| `date_from` | string (fecha ISO) | no | rango <= 92 días; se aplica a la fecha de creación del pedido | hoy - 6 días |
+| `date_to` | string (fecha ISO) | no | >= `date_from` | hoy (UTC) |
+| `country` | string | no | AR, MX, CL, CO, UY, PE | todos (una fila por país si `group_by=country`) |
 | `group_by` | enum | no | `none`, `country` | `none` |
 
 ```sql
@@ -278,26 +280,27 @@ ORDER BY {order_expr}
 LIMIT 50
 ```
 
-`approx_percentile` returns `double`; wrapper casts as shown. Averages ignore NULLs, so each stage has its
-own implicit sample size; the tool also returns `orders_delivered` and the notes warn that recent
-orders not yet delivered are excluded (right-censoring biases short ranges toward faster times).
+`approx_percentile` devuelve `double`; el wrapper castea como se muestra. Los promedios ignoran los NULL, por lo que cada
+etapa tiene su propio tamaño de muestra implícito; la herramienta también devuelve `orders_delivered` y las notas advierten
+que se excluyen los pedidos recientes que todavía no se entregaron (la censura por la derecha sesga los rangos cortos hacia
+tiempos más rápidos).
 
-**Output columns.** `[country] orders_created, orders_delivered, avg_hours_to_pay, avg_hours_to_ship, avg_hours_in_transit, avg_hours_end_to_end, p50_hours_end_to_end, p90_hours_end_to_end`.
-**Example.** "How long does an order take from pending to delivered?"
+**Columnas de salida.** `[country] orders_created, orders_delivered, avg_hours_to_pay, avg_hours_to_ship, avg_hours_in_transit, avg_hours_end_to_end, p50_hours_end_to_end, p90_hours_end_to_end`.
+**Ejemplo.** "¿Cuánto tarda un pedido desde pending hasta delivered?"
 
 ---
 
 ## 7. `get_top_customers_ltv`
 
-**Description for the LLM.** Top customers by lifetime revenue (sum of order lines for paid, shipped or
-delivered orders), identified only by `customer_id`. Use it for "who are our best customers". It never
-returns names, emails or email domains; to find out who a customer is, a human must look up the id in
-the source system. Revenue is all-time, not limited to a period.
+**Descripción para el LLM.** Principales clientes por ingresos de toda su vida (suma de las líneas de pedido de pedidos
+paid, shipped o delivered), identificados solo por `customer_id`. Úsala para "¿quiénes son nuestros mejores clientes?".
+Nunca devuelve nombres, emails ni dominios de email; para saber quién es un cliente, una persona debe buscar el id en
+el sistema de origen. Los ingresos son históricos totales, no limitados a un período.
 
-| Parameter | Type | Required | Allowed / limits | Default |
+| Parámetro | Tipo | Obligatorio | Permitido / límites | Por defecto |
 |---|---|---|---|---|
 | `top_n` | integer | no | 1..50 | 10 |
-| `country` | string | no | AR, MX, CL, CO, UY, PE | all |
+| `country` | string | no | AR, MX, CL, CO, UY, PE | todos |
 | `min_orders` | integer | no | 1..1000 | 1 |
 
 ```sql
@@ -316,19 +319,19 @@ ORDER BY revenue DESC, customer_id
 LIMIT ?                            -- top_n
 ```
 
-The explicit column list is the PII guardrail: `email_domain` exists in gold but is deliberately not
-selected (quasi-identifier). `revenue_rank` is computed after the filters, so it is the rank within the
-filtered set.
+La lista explícita de columnas es el guardrail de PII: `email_domain` existe en gold pero deliberadamente no se
+selecciona (cuasi-identificador). `revenue_rank` se calcula después de los filtros, por lo que es el ranking dentro del
+conjunto filtrado.
 
-**Output columns.** `customer_id, country, orders, lifetime_revenue_usd, avg_order_value_usd, first_order_at, last_order_at, revenue_rank`.
-**Example.** "Who are our 10 best customers in Chile?"
+**Columnas de salida.** `customer_id, country, orders, lifetime_revenue_usd, avg_order_value_usd, first_order_at, last_order_at, revenue_rank`.
+**Ejemplo.** "¿Quiénes son nuestros 10 mejores clientes en Chile?"
 
 ---
 
-## 8. `data_freshness` (optional, metadata)
+## 8. `data_freshness` (opcional, metadatos)
 
-**Description for the LLM.** Reports the latest data date in each gold table. Call it first when the user
-asks about "today" or "now", or whenever a result looks empty or stale. Takes no parameters.
+**Descripción para el LLM.** Informa la fecha de datos más reciente de cada tabla gold. Llámala primero cuando el usuario
+pregunte por "hoy" o "ahora", o cada vez que un resultado parezca vacío o desactualizado. No recibe parámetros.
 
 ```sql
 SELECT 'daily_sales' AS table_name, CAST(max(order_date) AS TIMESTAMP) AS latest_data_at, NULL AS built_at
@@ -350,65 +353,65 @@ SELECT 'customer_ltv', max(last_order_at), NULL
 FROM shopflow_gold.customer_ltv
 ```
 
-Types differ across branches, hence the explicit casts; `NULL` in the first branch is cast by Athena to
-the type of the later branches (`TIMESTAMP`). If that fails in practice, write `CAST(NULL AS TIMESTAMP)`.
+Los tipos difieren entre ramas, de ahí los casts explícitos; Athena castea el `NULL` de la primera rama al
+tipo de las ramas siguientes (`TIMESTAMP`). Si eso falla en la práctica, escribe `CAST(NULL AS TIMESTAMP)`.
 
-**Output columns.** `table_name, latest_data_at, built_at`.
-**Example.** "Is the data up to date?" / "Up to which date do we have sales?"
+**Columnas de salida.** `table_name, latest_data_at, built_at`.
+**Ejemplo.** "¿Los datos están actualizados?" / "¿Hasta qué fecha tenemos ventas?"
 
 ---
 
 ## Guardrails
 
-- **Hard limits.** Read-only role (Athena `athena:StartQueryExecution` and Glue read on `shopflow_gold`
-  only, S3 read on `gold/`), workgroup scan cap of 1 GB, at most 50 rows per call, date ranges up to 92
-  days, 1 query per tool call, tool timeout (e.g. 30 s) with a clear error message. Cache identical
-  calls for a short TTL (60 s) to cap cost.
-- **Zero rows.** Never invent numbers. Return `rows: []` plus a note: "No rows for these filters
-  between X and Y; data available until Z (see data_freshness)." The agent should say that, suggest a
-  wider range or removing a filter, and not treat 0 rows as 0 sales. `late_shipments` and
-  `payment_failure_reasons` can legitimately be empty (the audit allows it); for these, empty means
-  "nothing late / no failures as of the last build".
-- **Units and currency.** All money is USD: `orders.currency` defaults to `'USD'` in the source schema
-  but is not carried into gold, so the tools label every amount `_usd` and state the assumption; no
-  currency conversion is done. `failure_rate` is a fraction (0.0842 = 8.42%); the agent must show it as
-  a percentage. `hours_*` are real hours under the compressed clock (1 simulated hour = 1 real minute).
-- **Freshness.** Gold is a full rebuild by a scheduled job, so it is a snapshot, not real time. Every
-  response carries `data_as_of`: for `late_shipments` it is `snapshot_at`; for the other tables it is the
-  latest date available (`max(order_date)`, `max(attempt_date)`, `max(last_order_at)`, ...). If the
-  requested `date_to` is later than `data_as_of`, or `data_as_of` is more than the expected build
-  interval old, the agent must say "data as of ..." instead of presenting it as live. "Today" means the
-  current UTC date, which may not match a user's local date in LATAM.
-- **PII.** Gold has no names or emails; the tools additionally never select `email_domain`. Customer
-  ids are the only identifier returned; shipment and order ids are allowed.
-- **Fixed SQL.** No tool accepts free text that reaches SQL. Enumerations and ranges are validated in
-  the wrapper before the query, values go through `ExecutionParameters`, and the few structural
-  fragments (`group_by`) are picked from an allow-list.
-- **Consistency across tables.** Publish is atomic per table, not across tables, so right after a build
-  two tools may briefly disagree. Revenue in `daily_sales` and `customer_ltv` is reconciled by the audit
-  and should match when summed over all time.
+- **Límites estrictos.** Rol de solo lectura (Athena `athena:StartQueryExecution` y lectura de Glue solo sobre
+  `shopflow_gold`, lectura de S3 sobre `gold/`), tope de escaneo de 1 GB en el workgroup, como máximo 50 filas por llamada,
+  rangos de fechas de hasta 92 días, 1 consulta por llamada a herramienta, timeout de la herramienta (p. ej., 30 s) con un
+  mensaje de error claro. Las llamadas idénticas se cachean con un TTL corto (60 s) para acotar el costo.
+- **Cero filas.** Nunca inventar números. Devolver `rows: []` más una nota: "No hay filas para estos filtros
+  entre X e Y; hay datos disponibles hasta Z (ver data_freshness)." El agente debe decir eso, sugerir un rango
+  más amplio o quitar un filtro, y no interpretar 0 filas como 0 ventas. `late_shipments` y
+  `payment_failure_reasons` pueden estar legítimamente vacías (la auditoría lo permite); en esos casos, vacío significa
+  "nada atrasado / sin fallos según el último build".
+- **Unidades y moneda.** Todos los montos están en USD: `orders.currency` tiene `'USD'` como valor por defecto en el esquema
+  de origen pero no se propaga a gold, así que las herramientas etiquetan cada monto con `_usd` y explicitan el supuesto; no
+  se hace conversión de moneda. `failure_rate` es una fracción (0.0842 = 8.42%); el agente debe mostrarla como
+  porcentaje. Los `hours_*` son horas reales bajo el reloj comprimido (1 hora simulada = 1 minuto real).
+- **Frescura.** Gold se reconstruye por completo mediante un job programado, por lo que es un snapshot, no tiempo real. Toda
+  respuesta incluye `data_as_of`: para `late_shipments` es `snapshot_at`; para las demás tablas es la
+  fecha más reciente disponible (`max(order_date)`, `max(attempt_date)`, `max(last_order_at)`, ...). Si el
+  `date_to` solicitado es posterior a `data_as_of`, o si `data_as_of` tiene más antigüedad que el intervalo de build
+  esperado, el agente debe decir "datos al ..." en lugar de presentarlos como en vivo. "Hoy" significa la
+  fecha UTC actual, que puede no coincidir con la fecha local de un usuario en LATAM.
+- **PII.** Gold no tiene nombres ni emails; además, las herramientas nunca seleccionan `email_domain`. Los ids de cliente
+  son el único identificador que se devuelve; los ids de envío y de pedido están permitidos.
+- **SQL fijo.** Ninguna herramienta acepta texto libre que llegue al SQL. Las enumeraciones y los rangos se validan en
+  el wrapper antes de la consulta, los valores pasan por `ExecutionParameters`, y los pocos fragmentos
+  estructurales (`group_by`) se eligen de una allow-list.
+- **Consistencia entre tablas.** La publicación es atómica por tabla, no entre tablas, por lo que justo después de un build
+  dos herramientas pueden discrepar brevemente. Los ingresos de `daily_sales` y `customer_ltv` se concilian en la auditoría
+  y deberían coincidir al sumarse sobre todo el histórico.
 
-## Data limitations found (gaps against the 5 questions)
+## Limitaciones de datos encontradas (brechas frente a las 5 preguntas)
 
-1. **Late rate impossible.** `late_shipments` stores only late rows; there is no on-time count per
-   carrier/country, so Q3 can list and rank by volume but not give "% late". Fix: add a
-   `shipments_daily` (date, carrier, country, shipments, delivered, late) gold table.
-2. **Late status is frozen at build.** `hours_late` and `open_overdue` use `current_timestamp()` at build
-   time; a shipment that became overdue after the last build does not show up until the next one.
-   Returned shipments (`status = 'returned'`) are excluded entirely.
-3. **No build timestamp except `snapshot_at`** (only in `late_shipments`, which can be empty). Suggest a
-   `gold_build_info` table (table_name, built_at, silver versions from the manifest) for `data_freshness`.
-4. **Failure reasons have no denominator by themselves.** Reasons by provider need a join with
-   `payment_provider_daily` (done in tool 3). The grain is payment attempt, not order, so retries inflate
-   attempts; there is no order-level "payment ultimately failed" metric. `failure_code` is free text and
-   can be NULL (shown as `unknown`).
-5. **Sales are by order creation date and current status.** An order that was paid and later cancelled
-   leaves the figures retroactively; there is no payment-date view and no refunds/cancellations in
-   `daily_sales`. Orders are not additive across categories (a multi-category order is counted in each).
-6. **No currency column in gold**; USD is an assumption taken from the source DDL default.
-7. **Lead times: no category, no carrier, only country**; stages are the first occurrence of each status
-   (`min(changed_at)`); cancelled orders have `cancelled_at` but no duration. Averages over short, recent
-   windows are biased low because undelivered orders are excluded. Under the compressed clock all
-   durations are tiny and not realistic.
-8. **`customer_ltv` has `email_domain`**, a quasi-identifier, which is excluded from the tool; LTV is
-   all-time and cannot be filtered by period. No customer segment or name exists in gold (by design).
+1. **Tasa de atrasos imposible.** `late_shipments` guarda solo las filas atrasadas; no hay conteo de envíos a tiempo por
+   transportista/país, así que la P3 puede listar y ordenar por volumen pero no dar un "% de atrasos". Solución: agregar una
+   tabla gold `shipments_daily` (date, carrier, country, shipments, delivered, late).
+2. **El estado de atraso queda congelado en el build.** `hours_late` y `open_overdue` usan `current_timestamp()` al momento
+   del build; un envío que pasó a estar vencido después del último build no aparece hasta el siguiente.
+   Los envíos devueltos (`status = 'returned'`) quedan excluidos por completo.
+3. **No hay timestamp de build salvo `snapshot_at`** (solo en `late_shipments`, que puede estar vacía). Se sugiere una
+   tabla `gold_build_info` (table_name, built_at, versiones de silver del manifiesto) para `data_freshness`.
+4. **Los motivos de fallo no tienen denominador por sí solos.** Los motivos por proveedor requieren un join con
+   `payment_provider_daily` (lo hace la herramienta 3). La granularidad es el intento de pago, no el pedido, por lo que los
+   reintentos inflan los intentos; no existe una métrica a nivel pedido de "el pago finalmente falló". `failure_code` es texto
+   libre y puede ser NULL (se muestra como `unknown`).
+5. **Las ventas se basan en la fecha de creación del pedido y su estado actual.** Un pedido que se pagó y luego se canceló
+   sale de las cifras de forma retroactiva; no hay una vista por fecha de pago ni reembolsos/cancelaciones en
+   `daily_sales`. Los pedidos no son aditivos entre categorías (un pedido con varias categorías se cuenta en cada una).
+6. **No hay columna de moneda en gold**; USD es un supuesto tomado del valor por defecto del DDL de origen.
+7. **Lead times: sin categoría, sin transportista, solo país**; las etapas son la primera ocurrencia de cada estado
+   (`min(changed_at)`); los pedidos cancelados tienen `cancelled_at` pero no duración. Los promedios sobre ventanas cortas y
+   recientes están sesgados hacia abajo porque se excluyen los pedidos no entregados. Bajo el reloj comprimido todas las
+   duraciones son mínimas y no son realistas.
+8. **`customer_ltv` tiene `email_domain`**, un cuasi-identificador, que se excluye de la herramienta; el LTV es
+   histórico total y no se puede filtrar por período. No existe segmento ni nombre de cliente en gold (por diseño).

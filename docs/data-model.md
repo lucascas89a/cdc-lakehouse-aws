@@ -1,59 +1,59 @@
-# Data model
+# Modelo de datos
 
-## Domain: ShopFlow
+## Dominio: ShopFlow
 
-ShopFlow is a fictional e-commerce company selling across LATAM. Its operational
-database (PostgreSQL) is the source of truth; the lakehouse never writes back to it.
+ShopFlow es una empresa ficticia de e-commerce que vende en LATAM. Su base de datos
+operativa (PostgreSQL) es la fuente de verdad; el lakehouse nunca escribe en ella.
 
-The domain was chosen because it produces the kinds of changes that make CDC worth
-it, and that a batch extract would miss or flatten:
+Se eligió este dominio porque genera el tipo de cambios que justifican usar CDC, y que
+una extracción batch perdería o aplanaría:
 
-| Behaviour in the source | Why it matters downstream |
+| Comportamiento en el origen | Por qué importa aguas abajo |
 |---|---|
-| Orders move through `pending → paid → shipped → delivered` (or `cancelled`) | Funnel timing and status history only exist if every transition is captured |
-| Payments fail and are retried as new rows | Failure rate by provider and reason; revenue must count only captured payments |
-| Product prices change | Revenue must use the price at purchase time; silver keeps price history (SCD2) |
-| Shipments have a promised date | Late deliveries are an operational alert the AI agent can surface |
-| Customers hold PII (email, name) | Masked in silver; gold and the agent never see raw PII |
+| Los pedidos pasan por `pending → paid → shipped → delivered` (o `cancelled`) | Los tiempos del embudo y el historial de estados solo existen si se captura cada transición |
+| Los pagos fallan y se reintentan como filas nuevas | Tasa de fallos por proveedor y motivo; los ingresos deben contar solo los pagos capturados |
+| Los precios de los productos cambian | Los ingresos deben usar el precio al momento de la compra; silver conserva el historial de precios (SCD2) |
+| Los envíos tienen una fecha prometida | Las entregas tardías son una alerta operativa que el agente de IA puede mostrar |
+| Los clientes contienen PII (email, nombre) | Se enmascara en silver; gold y el agente nunca ven PII sin procesar |
 
-## Source tables (`shop` schema)
+## Tablas de origen (esquema `shop`)
 
 ```mermaid
 erDiagram
-    customers ||--o{ orders : places
-    orders ||--|{ order_items : contains
-    products ||--o{ order_items : "sold as"
-    orders ||--o{ payments : "paid by (with retries)"
-    orders ||--o| shipments : "shipped as"
+    customers ||--o{ orders : realiza
+    orders ||--|{ order_items : contiene
+    products ||--o{ order_items : "vendido como"
+    orders ||--o{ payments : "pagado con (con reintentos)"
+    orders ||--o| shipments : "enviado como"
 ```
 
-| Table | Grain | Key mutable columns |
+| Tabla | Granularidad | Columnas mutables principales |
 |---|---|---|
-| `customers` | one row per customer | `email`, `full_name`, `country` |
-| `products` | one row per SKU | `unit_price`, `is_active` |
-| `orders` | one row per order | `status`, `total_amount` |
-| `order_items` | one row per order line | (insert-only in practice) |
-| `payments` | one row per payment attempt | `status`, `failure_code` |
-| `shipments` | one row per order shipped | `status`, `shipped_at`, `delivered_at` |
+| `customers` | una fila por cliente | `email`, `full_name`, `country` |
+| `products` | una fila por SKU | `unit_price`, `is_active` |
+| `orders` | una fila por pedido | `status`, `total_amount` |
+| `order_items` | una fila por línea de pedido | (en la práctica, solo inserciones) |
+| `payments` | una fila por intento de pago | `status`, `failure_code` |
+| `shipments` | una fila por pedido enviado | `status`, `shipped_at`, `delivered_at` |
 
 DDL: [`docker/postgres/init/01_schema.sql`](../docker/postgres/init/01_schema.sql).
 
-### CDC-specific choices
+### Decisiones específicas de CDC
 
-- **`REPLICA IDENTITY FULL`** on every table, so update and delete events carry the
-  full previous row. Costs some WAL volume; acceptable at this scale and documented
-  as a trade-off for production.
-- **`updated_at` maintained by trigger**, not by the application, so every change
-  has a trustworthy timestamp even when a client forgets to set it.
-- **One publication (`shopflow_cdc`) for the whole schema**, consumed by Debezium
-  with the native `pgoutput` plugin (no extensions to install on the source).
+- **`REPLICA IDENTITY FULL`** en todas las tablas, para que los eventos de update y delete
+  incluyan la fila anterior completa. Implica algo más de volumen de WAL; es aceptable a
+  esta escala y queda documentado como trade-off para producción.
+- **`updated_at` mantenido por trigger**, no por la aplicación, para que cada cambio
+  tenga un timestamp confiable aunque un cliente olvide asignarlo.
+- **Una sola publicación (`shopflow_cdc`) para todo el esquema**, consumida por Debezium
+  con el plugin nativo `pgoutput` (sin extensiones que instalar en el origen).
 
-## Target questions (what gold must answer)
+## Preguntas objetivo (lo que gold debe responder)
 
-These drive the gold layer and the AI agent's tools:
+Estas preguntas guían la capa gold y las herramientas del agente de IA:
 
-1. How much did we sell today / this week, by country and category?
-2. What share of payments fail, by provider and failure reason?
-3. Which orders are late against their promised delivery date right now?
-4. How long does an order take from `pending` to `delivered`?
-5. Who are the top customers by lifetime value (without exposing PII)?
+1. ¿Cuánto vendimos hoy / esta semana, por país y categoría?
+2. ¿Qué proporción de los pagos falla, por proveedor y motivo de fallo?
+3. ¿Qué pedidos están atrasados respecto de su fecha de entrega prometida en este momento?
+4. ¿Cuánto tarda un pedido desde `pending` hasta `delivered`?
+5. ¿Quiénes son los mejores clientes por valor de vida (lifetime value) sin exponer PII?
